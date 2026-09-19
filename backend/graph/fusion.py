@@ -32,14 +32,14 @@ from sklearn.cluster import DBSCAN
 from tqdm import tqdm
 
 from ..config import settings as parameter
-from ..config.settings import get_embed_model
-from ..core.prompt import GRAPH_FIELD_SEP, PROMPTS
 from ..llm import (
     get_llm_response,
     get_mmllm_response,
     normalize_to_json,
     normalize_to_json_list,
 )
+from ..llm.client import _invoke_titan_embed
+from ..core.prompt import GRAPH_FIELD_SEP, PROMPTS
 from ..utils.base import ensure_quoted, load_json, logger
 
 # ============================================================================
@@ -171,14 +171,14 @@ def _classify_by_nearest_neighbor(input_embeddings, reference_embeddings, labels
 
 def _encode_and_cluster(descriptions: list[str], entity_names: list[str], relationships: list[dict]):
     """Embed + cluster in one executor-safe function (no async allowed here)."""
-    embeddings = _sanitize_embeddings(np.array(get_embed_model().encode(descriptions)))
+    embeddings = _sanitize_embeddings(_invoke_titan_embed(descriptions))
     labels = _compute_spectral_labels(embeddings, entity_names, relationships)
     return embeddings, labels
 
 
 def _encode_texts(texts: list[str]) -> np.ndarray:
     """Embed a list of texts — executor-safe."""
-    return np.array(get_embed_model().encode(texts))
+    return _invoke_titan_embed(texts)
 
 
 # ============================================================================

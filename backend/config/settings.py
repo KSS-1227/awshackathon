@@ -22,69 +22,54 @@ load_dotenv(dotenv_path=str(_backend_env))
 # equivalent in this region); it is not used for text or vision inference.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY", "")
 
-# Bedrock Claude Haiku 4.5 — text (entity extraction, RAG answers, fusion)
+# Amazon Nova Pro — text AND vision (one model, one client, Converse API).
+# Used by: text2graph.py (entity/relation extraction),
+#           img2graph.py (vision scene-graph extraction),
+#           query.py (RAG answer synthesis, multimodal augmentation),
+#           fusion.py (graph merging).
+# APAC cross-region inference profile routes to ap-south-1, ap-southeast-1, etc.
 BEDROCK_TEXT_MODEL_ID = os.environ.get(
     "BEDROCK_TEXT_MODEL_ID",
-    "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "apac.amazon.nova-pro-v1:0",
 )
 
-# Bedrock Claude Haiku 4.5 — vision (img2graph, scene-graph extraction)
+# Same model for vision — Nova Pro supports image input natively via Converse.
+# Kept as a separate env var so it can be overridden independently if needed.
 BEDROCK_MM_MODEL_ID = os.environ.get(
     "BEDROCK_MM_MODEL_ID",
-    "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "apac.amazon.nova-pro-v1:0",
 )
 
-# ============ Embedding Model ============
-_default_embed_dir = (
-    "./models/all-MiniLM-L6-v2"
-    if os.path.exists("./models/all-MiniLM-L6-v2")
-    else "sentence-transformers/all-MiniLM-L6-v2"
+# Amazon Titan Text Embeddings V2 — 1024-dim vectors via InvokeModel.
+# Used by: local_embedding() in llm/client.py,
+#           query.py (query vector), builder.py (entity vectors),
+#           fusion.py (description embeddings), embeddings_storage.py.
+# Uses direct model ID (not inference profile) — Titan embed is InvokeModel only.
+BEDROCK_EMBED_MODEL_ID = os.environ.get(
+    "BEDROCK_EMBED_MODEL_ID",
+    "amazon.titan-embed-text-v2:0",
 )
-EMBEDDING_MODEL_DIR = os.environ.get("EMBEDDING_MODEL_DIR", _default_embed_dir)
+BEDROCK_EMBED_DIMENSIONS = int(os.environ.get("BEDROCK_EMBED_DIMENSIONS", "1024"))
 
-# Sentinel kept for backward-compat imports (e.g. `from backend.config import EMBED_MODEL`).
-# Always use get_embed_model() when you need the actual model instance.
+# ============ Embedding Model (REMOVED — replaced by Titan Embeddings V2) ============
+# SentenceTransformer / local all-MiniLM-L6-v2 has been replaced by
+# Amazon Titan Text Embeddings V2 (BEDROCK_EMBED_MODEL_ID).
+# EMBEDDING_MODEL_DIR and get_embed_model() are kept as stubs so any
+# old import doesn't hard-error at import time, but raise at call time.
+EMBEDDING_MODEL_DIR = os.environ.get("EMBEDDING_MODEL_DIR", "")
 EMBED_MODEL = None
-
-_embed_model_instance = None
 
 
 def get_embed_model():
-    """Return the shared SentenceTransformer instance, loading it on first call.
+    """REMOVED: embeddings now use Titan Text Embeddings V2 via Bedrock.
 
-    Lazy-loading prevents the ~90 MB model download from blocking the FastAPI
-    startup sequence. Auth, workspace, and case endpoints all start immediately;
-    the model is only loaded when the first document upload or query arrives.
-
-    Raises
-    ------
-    RuntimeError
-        If sentence-transformers is not installed or the model cannot be loaded.
+    This stub exists only so legacy imports don't crash at import time.
+    Any code still calling this at runtime has not been migrated yet.
     """
-    global _embed_model_instance
-    if _embed_model_instance is not None:
-        return _embed_model_instance
-
-    try:
-        from sentence_transformers import SentenceTransformer  # noqa: PLC0415
-    except ImportError as exc:
-        raise RuntimeError(
-            "sentence-transformers is not installed. "
-            "Run: pip install sentence-transformers"
-        ) from exc
-
-    logger.info("Loading embedding model from %s …", EMBEDDING_MODEL_DIR)
-    try:
-        _embed_model_instance = SentenceTransformer(EMBEDDING_MODEL_DIR, device="cpu")
-        logger.info("Embedding model loaded successfully.")
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to load embedding model from '{EMBEDDING_MODEL_DIR}': {exc}. "
-            "Check that the model path or HuggingFace model name is correct and "
-            "that you have an active internet connection for the first download."
-        ) from exc
-
-    return _embed_model_instance
+    raise RuntimeError(
+        "get_embed_model() is removed — use bedrock_embed() from llm/client.py "
+        "or the async embed_texts() helper instead."
+    )
 
 
 # ============ Directory Paths ============

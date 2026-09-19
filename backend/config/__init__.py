@@ -5,6 +5,8 @@ from .settings import (
     ALLOWED_ORIGINS,
     BEDROCK_MM_MODEL_ID,
     BEDROCK_TEXT_MODEL_ID,
+    BEDROCK_EMBED_MODEL_ID,
+    BEDROCK_EMBED_DIMENSIONS,
     CACHE_PATH,
     EMBED_MODEL,
     EMBEDDING_MODEL_DIR,
@@ -25,13 +27,15 @@ from .settings import (
     WORKING_DIR,
     AWS_REGION,
     QueryParam,
-    get_embed_model,
+    get_embed_model,  # stub — raises RuntimeError if called
 )
 
 __all__ = [
     "ALLOWED_ORIGINS",
     "BEDROCK_MM_MODEL_ID",
     "BEDROCK_TEXT_MODEL_ID",
+    "BEDROCK_EMBED_MODEL_ID",
+    "BEDROCK_EMBED_DIMENSIONS",
     "CACHE_PATH",
     "EMBEDDING_MODEL_DIR",
     "EMBED_MODEL",

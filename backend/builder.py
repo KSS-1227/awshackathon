@@ -447,10 +447,10 @@ class MMKGBuilder:
 
         logger.info(f"ðŸ§¬ Step 5c/5 â€” Embedding {len(pending)} new entit{'y' if len(pending)==1 else 'ies'}")
 
-        embed_model = parameter.get_embed_model()
+        from ..llm import embed_texts
         node_ids     = [nid for nid, _ in pending]
         descriptions = [desc for _, desc in pending]
-        vectors      = embed_model.encode(descriptions)
+        vectors      = await embed_texts(descriptions)
 
         for node_id, vector in zip(node_ids, vectors):
             await vector_store.upsert_embedding(self.workspace_id, node_id, vector, graph_storage)

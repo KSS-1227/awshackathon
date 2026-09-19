@@ -41,7 +41,6 @@ class GraphRAGQuery:
                 "Knowledge graph snapshot not found. Upload and index a document first. "
                 f"(Expected: {self.graph_path})"
             )
-        self.embed_model    = parameter.get_embed_model()
         self.graph          = nx.read_graphml(self.graph_path)
         self.node_list      = list(self.graph.nodes())
         self.llm_cache      = JsonKVStorage(namespace="llm_response_cache",    storage_dir=self.cache_path)
@@ -56,7 +55,8 @@ class GraphRAGQuery:
         )
 
     async def find_similar_nodes(self, query: str, top_k: int = 5):
-        q_emb = self.embed_model.encode([query])[0]
+        from ..llm import embed_texts
+        q_emb = (await embed_texts([query]))[0]
         return await vector_store.top_k_similar(self.workspace_id, q_emb, self.graph_storage, k=top_k)
 
     def _find_most_related_text_unit_from_entities(self, node_datas):

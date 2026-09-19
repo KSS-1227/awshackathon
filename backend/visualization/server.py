@@ -149,8 +149,8 @@ def graph_retrieve():
     try:
         import numpy as np
         from sklearn.metrics.pairwise import cosine_similarity
+        from ..llm.client import _invoke_titan_embed
 
-        embed_model  = parameter.get_embed_model()
         embed_path   = os.path.join(parameter.OUTPUT_DIR, f"{parameter.MMKG_NAME}_emb.npy")
         graph_path   = _get_graph_path()
 
@@ -162,9 +162,9 @@ def graph_retrieve():
         if os.path.exists(embed_path):
             embeddings = np.load(embed_path)
         else:
-            embeddings = embed_model.encode(descs)
+            embeddings = _invoke_titan_embed(descs)
 
-        q_emb = embed_model.encode([query])
+        q_emb = _invoke_titan_embed([query])
         sims  = cosine_similarity(q_emb, embeddings)[0]
         idxs  = np.argsort(sims)[::-1][:top_k]
 
