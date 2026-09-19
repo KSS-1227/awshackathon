@@ -16,21 +16,23 @@ _project_root = _Path(__file__).parent.parent.parent  # backend/config/settings.
 _backend_env = _project_root / "backend" / ".env"
 load_dotenv(dotenv_path=str(_backend_env))
 
-# ============ LLM Configuration ============
-# One server-side OpenAI API key powers text, vision, and transcription.
-# The LLM_/MM_ names remain backwards-compatible deployment overrides.
+# ============ LLM Configuration — AWS Bedrock ============
+# All text and vision LLM calls go through AWS Bedrock (Claude Haiku 4.5).
+# OPENAI_API_KEY is retained ONLY for Whisper audio transcription (no Bedrock
+# equivalent in this region); it is not used for text or vision inference.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY", "")
 
-# Text LLM — entity extraction, relation building, RAG answers
-API_KEY    = OPENAI_API_KEY
-API_BASE   = os.environ.get("LLM_API_BASE",   "https://api.openai.com/v1")
-MODEL_NAME = os.environ.get("LLM_MODEL_NAME") or os.environ.get("OPENAI_MODEL", "gpt-4o")
+# Bedrock Claude Haiku 4.5 — text (entity extraction, RAG answers, fusion)
+BEDROCK_TEXT_MODEL_ID = os.environ.get(
+    "BEDROCK_TEXT_MODEL_ID",
+    "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+)
 
-# Multimodal LLM — image understanding, visual entity extraction, scene graphs
-# Uses the same OpenAI key and endpoint; gpt-4o supports vision natively.
-MM_API_KEY    = os.environ.get("MM_API_KEY") or OPENAI_API_KEY
-MM_API_BASE   = os.environ.get("MM_API_BASE",   "https://api.openai.com/v1")
-MM_MODEL_NAME = os.environ.get("MM_MODEL_NAME") or os.environ.get("OPENAI_MODEL", "gpt-4o")
+# Bedrock Claude Haiku 4.5 — vision (img2graph, scene-graph extraction)
+BEDROCK_MM_MODEL_ID = os.environ.get(
+    "BEDROCK_MM_MODEL_ID",
+    "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+)
 
 # ============ Embedding Model ============
 _default_embed_dir = (

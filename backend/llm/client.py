@@ -1,5 +1,14 @@
 """
 LLM and multimodal LLM client — async/sync wrappers with KV caching.
+AWS Bedrock backend using Claude Haiku 4.5 for both text and vision.
+
+Replaces the OpenAI AsyncOpenAI client that was in the initial commit.
+Interface is identical to the OpenAI version so all callers
+(model_if_cache, multimodel_if_cache, get_llm_response, get_mmllm_response)
+are unchanged — only the transport layer differs.
+
+Bedrock boto3 is synchronous; async is achieved via asyncio.run_in_executor
+so the FastAPI event loop is never blocked.
 """
 import ast
 import asyncio
@@ -7,73 +16,98 @@ import json
 import re
 from typing import Any
 
+import boto3
 import numpy as np
-from openai import AsyncOpenAI, OpenAI, RateLimitError
+from botocore.exceptions import ClientError
 
 from ..config.settings import (
-    API_BASE,
-    API_KEY,
+    BEDROCK_MM_MODEL_ID,
+    BEDROCK_TEXT_MODEL_ID,
+    AWS_REGION,
     get_embed_model,
-    MM_API_BASE,
-    MM_API_KEY,
-    MM_MODEL_NAME,
-    MODEL_NAME,
 )
 from ..storage.kv_storage import BaseKVStorage
 from ..utils.base import compute_args_hash, logger, wrap_embedding_func_with_attrs
 
 # ============================================================================
-# Singleton client pool
+# Singleton Bedrock client pool
 # ============================================================================
 
-_CLIENTS = {
-    "text_sync": None, "text_async": None,
-    "mm_sync": None,   "mm_async": None,
+_CLIENTS: dict[str, Any] = {
+    "text": None,
+    "mm": None,
 }
 
 
-def _get_client(is_async: bool = False, is_multimodal: bool = False):
-    key = f"{'mm' if is_multimodal else 'text'}_{'async' if is_async else 'sync'}"
+def _get_bedrock_client(is_multimodal: bool = False):
+    """Return singleton boto3 bedrock-runtime client (synchronous).
+
+    Bedrock boto3 is sync-only; callers wrap with run_in_executor.
+    Text and multimodal share the same endpoint — both keys point to the
+    same underlying client; the dict keeps the door open for future
+    per-model endpoint routing.
+    """
+    key = "mm" if is_multimodal else "text"
     if _CLIENTS[key] is None:
-        api_key  = MM_API_KEY  if is_multimodal else API_KEY
-        base_url = MM_API_BASE if is_multimodal else API_BASE
-        client_cls = AsyncOpenAI if is_async else OpenAI
-        _CLIENTS[key] = client_cls(api_key=api_key, base_url=base_url)
+        _CLIENTS[key] = boto3.client(
+            "bedrock-runtime",
+            region_name=AWS_REGION,
+        )
+        logger.info(
+            "✓ Bedrock client initialised (region=%s, model=%s)",
+            AWS_REGION,
+            BEDROCK_MM_MODEL_ID if is_multimodal else BEDROCK_TEXT_MODEL_ID,
+        )
     return _CLIENTS[key]
 
 
 # ============================================================================
-# Rate-limit retry helper
+# Rate-limit / throttle retry helper
 # ============================================================================
 
-async def _with_retry(coro_fn, max_retries: int = 6, base_delay: float = 10.0):
-    """Call coro_fn() with exponential backoff on RateLimitError (429).
+async def _with_retry(async_fn, max_retries: int = 6, base_delay: float = 10.0):
+    """Exponential backoff on Bedrock ThrottlingException.
 
-    Waits base_delay * 2^attempt seconds between retries, capped at 120s.
-    Raises the last exception if all retries are exhausted.
+    All other ClientErrors are re-raised immediately so callers see the
+    real error rather than waiting through 6 retries on a bad model ID.
     """
     for attempt in range(max_retries + 1):
         try:
-            return await coro_fn()
-        except RateLimitError as exc:
+            return await async_fn()
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code != "ThrottlingException":
+                raise
             if attempt == max_retries:
                 raise
             wait = min(base_delay * (2 ** attempt), 120.0)
             logger.warning(
-                "Rate limit hit (attempt %d/%d) — retrying in %.1fs: %s",
-                attempt + 1, max_retries, wait, exc,
+                "Bedrock throttled (attempt %d/%d) — retrying in %.1fs",
+                attempt + 1, max_retries, wait,
             )
             await asyncio.sleep(wait)
 
 
 # ============================================================================
-# Embedding
+# Shared Bedrock invoke helper
+# ============================================================================
+
+def _invoke_bedrock(client, model_id: str, request_body: dict) -> str:
+    """Synchronous Bedrock invoke_model call. Runs inside run_in_executor."""
+    response = client.invoke_model(
+        modelId=model_id,
+        body=json.dumps(request_body),
+    )
+    body = json.loads(response["body"].read())
+    return body["content"][0]["text"]
+
+
+# ============================================================================
+# Embedding (unchanged — local sentence-transformers, not Bedrock)
 # ============================================================================
 
 def _embedding_dim() -> int:
-    """Resolve embedding dimension lazily — avoids loading the model at import time."""
     model = get_embed_model()
-    # sentence-transformers renamed get_sentence_embedding_dimension → get_embedding_dimension
     if hasattr(model, "get_embedding_dimension"):
         return model.get_embedding_dimension()
     return model.get_sentence_embedding_dimension()
@@ -83,13 +117,8 @@ def _embedding_max_seq() -> int:
     return get_embed_model().max_seq_length
 
 
-# Use sentinel -1 for the decorator arguments so the EmbeddingFunc dataclass
-# is created without touching the model at import time.  The real values are
-# patched in on first call inside local_embedding().
 @wrap_embedding_func_with_attrs(embedding_dim=-1, max_token_size=-1)
 async def local_embedding(texts: list[str]) -> np.ndarray:
-    # Patch the wrapper attrs on first real call so callers that read
-    # .embedding_dim get the correct value after the model is loaded.
     if local_embedding.embedding_dim == -1:
         local_embedding.embedding_dim = _embedding_dim()
         local_embedding.max_token_size = _embedding_max_seq()
@@ -97,7 +126,7 @@ async def local_embedding(texts: list[str]) -> np.ndarray:
 
 
 # ============================================================================
-# Text LLM
+# Text LLM — Claude Haiku 4.5 via Bedrock
 # ============================================================================
 
 async def model_if_cache(
@@ -106,58 +135,66 @@ async def model_if_cache(
     history_messages: list[dict] | None = None,
     **kwargs,
 ) -> str:
+    """Text LLM call with optional KV caching. Identical interface to OpenAI version."""
     if history_messages is None:
         history_messages = []
-    client = _get_client(is_async=True, is_multimodal=False)
+
     hashing_kv: BaseKVStorage | None = kwargs.pop("hashing_kv", None)
 
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.extend(history_messages)
-    messages.append({"role": "user", "content": prompt})
+    messages = [*history_messages, {"role": "user", "content": prompt}]
 
     args_hash = None
     if hashing_kv:
-        args_hash = compute_args_hash(MODEL_NAME, messages)
+        args_hash = compute_args_hash(BEDROCK_TEXT_MODEL_ID, messages)
         cached = await hashing_kv.get_by_id(args_hash)
         if cached:
             return cached["return"]
 
-    response = await _with_retry(
-        lambda: client.chat.completions.create(
-            model=MODEL_NAME, messages=messages, **kwargs
+    request_body: dict = {
+        "anthropic_version": "bedrock-2023-06-01",
+        "max_tokens": kwargs.get("max_tokens", 4096),
+        "messages": messages,
+    }
+    if system_prompt:
+        request_body["system"] = system_prompt
+
+    async def _call():
+        client = _get_bedrock_client(is_multimodal=False)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, lambda: _invoke_bedrock(client, BEDROCK_TEXT_MODEL_ID, request_body)
         )
-    )
-    content = response.choices[0].message.content
+
+    content = await _with_retry(_call)
 
     if hashing_kv and args_hash:
-        await hashing_kv.upsert({args_hash: {"return": content, "model": MODEL_NAME}})
+        await hashing_kv.upsert({args_hash: {"return": content, "model": BEDROCK_TEXT_MODEL_ID}})
         await hashing_kv.index_done_callback()
 
     return content
 
 
 async def get_llm_response(cur_prompt: str, system_content: str) -> str:
-    """Async text LLM call — uses the shared AsyncOpenAI client so it never
-    blocks the event loop.  All callers (fusion helpers) must ``await`` this."""
-    client = _get_client(is_async=True, is_multimodal=False)
-    response = await _with_retry(
-        lambda: client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_content},
-                {"role": "user",   "content": cur_prompt},
-            ],
-            max_tokens=4096,
-            frequency_penalty=0.3,
+    """Async text LLM call — used by fusion helpers."""
+    request_body = {
+        "anthropic_version": "bedrock-2023-06-01",
+        "max_tokens": 4096,
+        "system": system_content,
+        "messages": [{"role": "user", "content": cur_prompt}],
+    }
+
+    async def _call():
+        client = _get_bedrock_client(is_multimodal=False)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, lambda: _invoke_bedrock(client, BEDROCK_TEXT_MODEL_ID, request_body)
         )
-    )
-    return response.choices[0].message.content
+
+    return await _with_retry(_call)
 
 
 # ============================================================================
-# Multimodal LLM
+# Multimodal LLM — Claude Haiku 4.5 vision via Bedrock
 # ============================================================================
 
 async def multimodel_if_cache(
@@ -167,66 +204,98 @@ async def multimodel_if_cache(
     history_messages: list[dict] | None = None,
     **kwargs,
 ) -> str:
+    """Vision LLM call with optional KV caching. Identical interface to OpenAI version.
+
+    img_base must be a base64-encoded JPEG string (no data-URI prefix).
+    This is what img2graph.py's _encode_image_base64() produces.
+    """
     if history_messages is None:
         history_messages = []
-    client = _get_client(is_async=True, is_multimodal=True)
+
     hashing_kv: BaseKVStorage | None = kwargs.pop("hashing_kv", None)
 
-    messages = []
-    messages.extend(history_messages)
-    messages.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
-    messages.append({
+    # Bedrock Claude vision message format
+    user_message = {
         "role": "user",
         "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base}"}},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": img_base,
+                },
+            },
             {"type": "text", "text": user_prompt},
         ],
-    })
+    }
+    messages = [*history_messages, user_message]
 
     args_hash = None
     if hashing_kv:
-        args_hash = compute_args_hash(MM_MODEL_NAME, messages)
+        args_hash = compute_args_hash(BEDROCK_MM_MODEL_ID, messages)
         cached = await hashing_kv.get_by_id(args_hash)
         if cached:
             return cached["return"]
 
-    response = await _with_retry(
-        lambda: client.chat.completions.create(
-            model=MM_MODEL_NAME, messages=messages, **kwargs
+    request_body: dict = {
+        "anthropic_version": "bedrock-2023-06-01",
+        "max_tokens": kwargs.get("max_tokens", 4096),
+        "system": system_prompt,
+        "messages": messages,
+    }
+
+    async def _call():
+        client = _get_bedrock_client(is_multimodal=True)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, lambda: _invoke_bedrock(client, BEDROCK_MM_MODEL_ID, request_body)
         )
-    )
-    content = response.choices[0].message.content
+
+    content = await _with_retry(_call)
 
     if hashing_kv and args_hash:
-        await hashing_kv.upsert({args_hash: {"return": content, "model": MM_MODEL_NAME}})
+        await hashing_kv.upsert({args_hash: {"return": content, "model": BEDROCK_MM_MODEL_ID}})
         await hashing_kv.index_done_callback()
 
     return content
 
 
 async def get_mmllm_response(cur_prompt: str, system_content: str, img_base: str) -> str:
-    """Async multimodal LLM call — uses the shared AsyncOpenAI client so it
-    never blocks the event loop.  All callers (fusion helpers) must ``await``
-    this."""
-    client = _get_client(is_async=True, is_multimodal=True)
-    response = await _with_retry(
-        lambda: client.chat.completions.create(
-            model=MM_MODEL_NAME,
-            messages=[
-                {"role": "system", "content": [{"type": "text", "text": system_content}]},
-                {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base}"}},
-                    {"type": "text", "text": cur_prompt},
-                ]},
-            ],
-            max_tokens=4096,
+    """Async vision LLM call — used by image_utils helpers."""
+    user_message = {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": img_base,
+                },
+            },
+            {"type": "text", "text": cur_prompt},
+        ],
+    }
+    request_body = {
+        "anthropic_version": "bedrock-2023-06-01",
+        "max_tokens": 4096,
+        "system": system_content,
+        "messages": [user_message],
+    }
+
+    async def _call():
+        client = _get_bedrock_client(is_multimodal=True)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, lambda: _invoke_bedrock(client, BEDROCK_MM_MODEL_ID, request_body)
         )
-    )
-    return response.choices[0].message.content
+
+    return await _with_retry(_call)
 
 
 # ============================================================================
-# JSON helpers
+# JSON helpers (unchanged)
 # ============================================================================
 
 def normalize_to_json(output: str) -> dict | None:
@@ -236,7 +305,7 @@ def normalize_to_json(output: str) -> dict | None:
         output = match.group(1)
     match = re.search(r"\{.*\}", output, re.DOTALL)
     if not match:
-        logger.debug(f"No JSON object found: {output[:100]}...")
+        logger.debug("No JSON object found: %s...", output[:100])
         return None
     json_str = match.group(0)
     try:
@@ -251,8 +320,8 @@ def normalize_to_json(output: str) -> dict | None:
         pass
     try:
         return ast.literal_eval(json_str)
-    except (ValueError, SyntaxError) as e:
-        logger.debug(f"JSON decode failed: {e}")
+    except (ValueError, SyntaxError) as exc:
+        logger.debug("JSON decode failed: %s", exc)
         return None
 
 

@@ -42,9 +42,9 @@ class AudioChunking:
         self.working_dir = working_dir
 
         # AsyncOpenAI so _transcribe() never blocks the event loop.
-        # Whisper must still reach api.openai.com directly — no base_url override.
+        # Whisper uses OpenAI directly — Bedrock has no Whisper equivalent.
         self.client = AsyncOpenAI(
-            api_key=settings.OPENAI_API_KEY or settings.API_KEY,
+            api_key=settings.OPENAI_API_KEY,
         )
 
     # ---------------------------------------------------------
