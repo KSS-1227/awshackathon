@@ -36,6 +36,8 @@ from backend.storage.s3_document_storage import (
     extract_entity_counts_from_graph,
 )
 from backend.storage.dynamodb_jobs import update_job_status
+from backend.storage.dynamodb_cases import update_case
+from backend.storage.s3_graph_storage import get_graph_s3_key
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +145,21 @@ async def process_uploaded_job(
             entities_extracted=entity_count,
             relationships_extracted=relationship_count,
         )
+        
+        # Step 6b: Update case with graph_id linking to S3 graph
+        graph_id = get_graph_s3_key(workspace_id, case_id)
+        logger.info(f"Linking graph to case: graph_id={graph_id}")
+        try:
+            await update_case(
+                case_id=case_id,
+                workspace_id=workspace_id,
+                graph_id=graph_id,
+                graph_status="completed",
+            )
+            logger.info(f"✅ Case {case_id} updated with graph_id")
+        except Exception as update_case_exc:
+            logger.error(f"Failed to update case with graph_id: {update_case_exc}")
+            # Don't fail the job if case update fails (graph is still valid)
         
     except Exception as exc:
         # Step 7: On exception, update status to failed
