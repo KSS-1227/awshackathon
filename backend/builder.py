@@ -1,18 +1,18 @@
-"""
-Pipeline orchestrator — wires all stages together.
+﻿"""
+Pipeline orchestrator â€” wires all stages together.
 
 Supports multi-format ingestion:
-  .pdf                          → PdfChunking
-  .docx                         → DocxChunking
-  .xlsx / .xls                  → ExcelChunking
-  .mp3 / .wav / .m4a / .flac   → AudioChunking
+  .pdf                          â†’ PdfChunking
+  .docx                         â†’ DocxChunking
+  .xlsx / .xls                  â†’ ExcelChunking
+  .mp3 / .wav / .m4a / .flac   â†’ AudioChunking
   .png / .jpg / .jpeg / .bmp /
-  .webp / .tif / .tiff          → ImageChunking
+  .webp / .tif / .tiff          â†’ ImageChunking
 
 All processors expose the same interface:
     texts, images = await processor.process()
 
-Everything downstream (TextChunking → Graph → Fusion → Output) is unchanged.
+Everything downstream (TextChunking â†’ Graph â†’ Fusion â†’ Output) is unchanged.
 
 Multi-file ingestion
 --------------------
@@ -50,7 +50,7 @@ os.makedirs(_cache_path, exist_ok=True)
 os.environ["CACHE_PATH"] = _cache_path
 
 # ---------------------------------------------------------------------------
-# Extension → processor mapping
+# Extension â†’ processor mapping
 # ---------------------------------------------------------------------------
 
 _PDF_EXTS   = {".pdf"}
@@ -123,12 +123,12 @@ class MMKGBuilder:
 
     async def index(self, file_path: str | None = None):
         file_path = file_path or self.file_path
-        logger.info(f"📂 Starting processing: {file_path}")
+        logger.info(f"ðŸ“‚ Starting processing: {file_path}")
 
         if self._is_already_processed(file_path):
             logger.info(
-                f"⏭️  '{Path(file_path).name}' was already indexed in this "
-                f"session — skipping re-processing, graph is unchanged"
+                f"â­ï¸  '{Path(file_path).name}' was already indexed in this "
+                f"session â€” skipping re-processing, graph is unchanged"
             )
             return
 
@@ -139,7 +139,7 @@ class MMKGBuilder:
         self._step_generate_report()
 
         self._mark_processed(file_path)
-        logger.info("✅ Knowledge graph build complete")
+        logger.info("âœ… Knowledge graph build complete")
 
     async def index_many(self, file_paths: list[str]) -> tuple[dict[str, str], int, int]:
         """Index multiple files, preprocessing them concurrently.
@@ -165,7 +165,7 @@ class MMKGBuilder:
         Returns
         -------
         tuple of (dict[str, str], int, int) where:
-            - dict maps filename → "processed" | "skipped" | "failed: <reason>"
+            - dict maps filename â†’ "processed" | "skipped" | "failed: <reason>"
             - first int is node_count from the final graph
             - second int is edge_count from the final graph
         """
@@ -176,29 +176,29 @@ class MMKGBuilder:
         node_count = 0
         edge_count = 0
 
-        # ── Partition: skip already-processed files up front ────────────
+        # â”€â”€ Partition: skip already-processed files up front â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         to_process: list[str] = []
         results:    dict[str, str] = {}
 
         for fp in file_paths:
             if self._is_already_processed(fp):
                 logger.info(
-                    "⏭️  '%s' already indexed — skipping", Path(fp).name
+                    "â­ï¸  '%s' already indexed â€” skipping", Path(fp).name
                 )
                 results[Path(fp).name] = "skipped"
             else:
                 to_process.append(fp)
 
         if not to_process:
-            logger.info("⏭️  All files already indexed, nothing to do")
+            logger.info("â­ï¸  All files already indexed, nothing to do")
             return results, node_count, edge_count
 
         logger.info(
-            "📂 Batch ingestion — %d file(s) to process (concurrently preprocessing)",
+            "ðŸ“‚ Batch ingestion â€” %d file(s) to process (concurrently preprocessing)",
             len(to_process),
         )
 
-        # ── Stage 1: concurrent preprocessing ───────────────────────────
+        # â”€â”€ Stage 1: concurrent preprocessing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Each coroutine reads its file, converts it to text/image chunks,
         # and merges those chunks into the shared kv_store_text_chunks.json.
         # TextChunking uses content-hash deduplication so concurrent writes
@@ -211,7 +211,7 @@ class MMKGBuilder:
                 await self._step_preprocessing(fp)
                 return fp, None
             except Exception as exc:
-                logger.error("❌ Preprocessing failed for %s: %s", Path(fp).name, exc)
+                logger.error("âŒ Preprocessing failed for %s: %s", Path(fp).name, exc)
                 return fp, str(exc)
 
         preprocess_outcomes = await asyncio.gather(
@@ -225,9 +225,9 @@ class MMKGBuilder:
                 results[Path(fp).name] = f"failed: {err}"
                 preprocessing_failed.add(fp)
 
-        # ── Stage 2: sequential graph merging ───────────────────────────
+        # â”€â”€ Stage 2: sequential graph merging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Entity extraction, image extraction, fusion, and CockroachDB upserts
-        # all write to shared state — must run one file at a time.
+        # all write to shared state â€” must run one file at a time.
         any_images = False
         for fp in to_process:
             if fp in preprocessing_failed:
@@ -239,25 +239,25 @@ class MMKGBuilder:
                     any_images = True
                 self._mark_processed(fp)
                 results[fname] = "processed"
-                logger.info("✅ Graph merge complete: %s", fname)
+                logger.info("âœ… Graph merge complete: %s", fname)
             except Exception as exc:
-                logger.error("❌ Graph merge failed for %s: %s", fname, exc)
+                logger.error("âŒ Graph merge failed for %s: %s", fname, exc)
                 results[fname] = f"failed: {exc}"
 
-        # ── Stage 3: post-processing (once across all files) ─────────────
+        # â”€â”€ Stage 3: post-processing (once across all files) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         processed_count = sum(1 for v in results.values() if v == "processed")
         if processed_count > 0:
             await self._step_embeddings()
             await self._step_save_output()
             node_count, edge_count = self._step_generate_report()
             logger.info(
-                "✅ Batch ingestion complete — %d processed, %d skipped, %d failed",
+                "âœ… Batch ingestion complete â€” %d processed, %d skipped, %d failed",
                 processed_count,
                 sum(1 for v in results.values() if v == "skipped"),
                 sum(1 for v in results.values() if v.startswith("failed")),
             )
         else:
-            logger.warning("⚠️  No files were successfully processed in this batch")
+            logger.warning("âš ï¸  No files were successfully processed in this batch")
 
         return results, node_count, edge_count
 
@@ -268,7 +268,7 @@ class MMKGBuilder:
     # check. That check answered "has ANYTHING ever been indexed in this
     # working_dir", which meant document #2, #3, ... were silently
     # skipped in full. This answers "has THIS specific file already been
-    # indexed", keyed by content hash — so re-uploading the exact same
+    # indexed", keyed by content hash â€” so re-uploading the exact same
     # file is still a safe no-op, but a genuinely new file always runs.
     # ------------------------------------------------------------------
 
@@ -319,11 +319,11 @@ class MMKGBuilder:
         # No existence check here anymore. TextChunking.text_chunking()
         # already hashes each doc/chunk's content (compute_mdhash_id) and
         # only inserts genuinely new content via filter_keys() against the
-        # existing JsonKVStorage — see ingestion/pdf_preprocessing.py. It
+        # existing JsonKVStorage â€” see ingestion/pdf_preprocessing.py. It
         # was always safe to call on every upload; the old guard above it
         # was the actual bug, not this step.
         ext = Path(file_path).suffix.lower()
-        logger.info(f"📄 Step 1/5 — File preprocessing [{ext}] for {Path(file_path).name}")
+        logger.info(f"ðŸ“„ Step 1/5 â€” File preprocessing [{ext}] for {Path(file_path).name}")
 
         processor = _build_processor(file_path, self.working_dir, self.use_mineru)
         texts, _images = await processor.process()
@@ -332,28 +332,28 @@ class MMKGBuilder:
         await text_chunking.text_chunking(texts, file_name=Path(file_path).name)
 
     async def _step_text_extraction(self):
-        logger.info("📝 Step 2/5 — Text entity extraction")
+        logger.info("ðŸ“ Step 2/5 â€” Text entity extraction")
 
         chunks = load_json(os.path.join(self.working_dir, "kv_store_text_chunks.json")) or {}
         if not chunks:
-            logger.info("⏭️  No text chunks available, skipping extraction")
+            logger.info("â­ï¸  No text chunks available, skipping extraction")
             return
 
         # Track which chunk_ids have already been through LLM extraction,
         # separately from the "graph file exists" check that used to gate
         # this whole step. On a second document, `chunks` now contains
-        # both old and new chunks (TextChunking accumulates them) — only
+        # both old and new chunks (TextChunking accumulates them) â€” only
         # feed the genuinely new ones to the LLM extractor.
         extracted_path = os.path.join(self.working_dir, "kv_store_extracted_chunks.json")
         extracted_ids  = set(load_json(extracted_path) or [])
 
         new_chunks = {cid: c for cid, c in chunks.items() if cid not in extracted_ids}
         if not new_chunks:
-            logger.info("⏭️  All chunks already extracted, skipping")
+            logger.info("â­ï¸  All chunks already extracted, skipping")
             return
 
         logger.info(
-            f"🔍 Extracting entities from {len(new_chunks)} new chunk(s) "
+            f"ðŸ” Extracting entities from {len(new_chunks)} new chunk(s) "
             f"({len(chunks) - len(new_chunks)} already extracted previously)"
         )
 
@@ -361,7 +361,7 @@ class MMKGBuilder:
         # the existing graph_chunk_entity_relation.graphml from disk
         # automatically if it's already there. So extractor.graph starts
         # from the PREVIOUS document's graph, and extract_entities()
-        # upserts the new entities/edges into it — passing only new_chunks
+        # upserts the new entities/edges into it â€” passing only new_chunks
         # here is what makes this an incremental merge instead of a
         # from-scratch rebuild.
         extractor = TextEntityExtractor(
@@ -380,10 +380,10 @@ class MMKGBuilder:
         img_ids         = list(image_data.keys())
 
         if not img_ids:
-            logger.info("⏭️  No images found, skipping image extraction")
+            logger.info("â­ï¸  No images found, skipping image extraction")
             return []
 
-        logger.info(f"🖼️  Step 3/5 — Image entity extraction ({len(img_ids)} images)")
+        logger.info(f"ðŸ–¼ï¸  Step 3/5 â€” Image entity extraction ({len(img_ids)} images)")
         images_dir = os.path.join(self.working_dir, "images")
         os.makedirs(images_dir, exist_ok=True)
 
@@ -407,13 +407,13 @@ class MMKGBuilder:
 
         # fusion() (graph/fusion.py) already loops per image_name and skips
         # only the images that already have their own graph_merged_{name}
-        # .graphml on disk — that per-image check is correct and granular.
+        # .graphml on disk â€” that per-image check is correct and granular.
         # The blanket check that used to live here ("does ANY merged file
         # exist anywhere in working_dir") short-circuited fusion entirely
         # the moment a single image had ever been fused, which meant a
         # second document's images were never fused in at all. Just call
         # fusion() every time and let its own per-image guard do the work.
-        logger.info(f"🔗 Step 4/5 — Graph fusion ({len(img_ids)} image(s) to check)")
+        logger.info(f"ðŸ”— Step 4/5 â€” Graph fusion ({len(img_ids)} image(s) to check)")
         await fusion(img_ids, working_dir=self.working_dir)
 
     async def _step_sync_graph_snapshot(self):
@@ -435,7 +435,7 @@ class MMKGBuilder:
 
     async def _step_embeddings(self):
         # Skips silently in local-only mode (no workspace_id, i.e. still on
-        # NetworkXStorage) — this step only applies once CockroachGraphStorage
+        # NetworkXStorage) â€” this step only applies once CockroachGraphStorage
         # is wired in, since it reads entities out of graph_nodes rows.
         if not self.workspace_id:
             return
@@ -444,10 +444,10 @@ class MMKGBuilder:
 
         pending = await vector_store.nodes_missing_embeddings(self.workspace_id)
         if not pending:
-            logger.info("⏭️  No new entities need embeddings")
+            logger.info("â­ï¸  No new entities need embeddings")
             return
 
-        logger.info(f"🧬 Step 5c/5 — Embedding {len(pending)} new entit{'y' if len(pending)==1 else 'ies'}")
+        logger.info(f"ðŸ§¬ Step 5c/5 â€” Embedding {len(pending)} new entit{'y' if len(pending)==1 else 'ies'}")
 
         embed_model = parameter.get_embed_model()
         node_ids     = [nid for nid, _ in pending]
@@ -458,14 +458,14 @@ class MMKGBuilder:
             await vector_store.upsert_embedding(self.workspace_id, node_id, vector)
 
     async def _step_save_output(self):
-        logger.info("💾 Step 5a/5 — Saving final graph")
+        logger.info("ðŸ’¾ Step 5a/5 â€” Saving final graph")
         _namespace, src_path = get_latest_graphml_file(self.working_dir)
         if not os.path.exists(src_path):
-            logger.warning(f"⚠️  Graph file not found: {src_path}")
+            logger.warning(f"âš ï¸  Graph file not found: {src_path}")
             return
         dest = os.path.join(self.output_dir, f"{self.mmkg_name}.graphml")
         shutil.copy2(src_path, dest)
-        logger.info(f"📦 Graph saved to: {dest}")
+        logger.info(f"ðŸ“¦ Graph saved to: {dest}")
         
         # Upload to S3 if enabled and workspace_id is available
         if self.workspace_id:
@@ -478,13 +478,13 @@ class MMKGBuilder:
                     case_id=self.mmkg_name,
                     graph_path=dest,
                 )
-                logger.info(f"✅ Graph uploaded to S3: {s3_key}")
+                logger.info(f"âœ… Graph uploaded to S3: {s3_key}")
             except Exception as exc:
-                logger.error(f"⚠️  Failed to upload graph to S3: {exc}")
+                logger.error(f"âš ï¸  Failed to upload graph to S3: {exc}")
                 # Continue processing even if S3 upload fails (Day 1 keeps local copy)
 
     def _step_generate_report(self) -> tuple[int, int]:
-        logger.info("📊 Step 5b/5 — Generating report")
+        logger.info("ðŸ“Š Step 5b/5 â€” Generating report")
         import networkx as nx
         graph_path = os.path.join(self.output_dir, f"{self.mmkg_name}.graphml")
         if not os.path.exists(graph_path):
@@ -496,7 +496,7 @@ class MMKGBuilder:
             type_counts[etype] = type_counts.get(etype, 0) + 1
 
         report_lines = [
-            f"# Knowledge Graph Build Report — {self.mmkg_name}\n",
+            f"# Knowledge Graph Build Report â€” {self.mmkg_name}\n",
             f"- **Nodes**: {G.number_of_nodes()}",
             f"- **Edges**: {G.number_of_edges()}",
             "\n## Entity Type Distribution\n",
@@ -505,5 +505,6 @@ class MMKGBuilder:
         report_path = os.path.join(self.output_dir, f"{self.mmkg_name}_report.md")
         with open(report_path, "w", encoding="utf-8") as f:
             f.write("\n".join(report_lines))
-        logger.info(f"📋 Report saved to: {report_path}")
+        logger.info(f"ðŸ“‹ Report saved to: {report_path}")
         return G.number_of_nodes(), G.number_of_edges()
+
