@@ -41,6 +41,7 @@ from .ingestion.docx_preprocessing import DocxChunking
 from .ingestion.excel_preprocessing import ExcelChunking
 from .ingestion.image_preprocessing import ImageChunking
 from .ingestion.pdf_preprocessing import PdfChunking, TextChunking
+from .storage.graph_storage import NetworkXStorage
 from .utils.base import get_latest_graphml_file, load_json, logger, write_json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -368,6 +369,7 @@ class MMKGBuilder:
             working_dir=self.working_dir,
             cache_dir=_cache_path,
             workspace_id=self.workspace_id,
+            graph_storage_cls=NetworkXStorage,
         )
         await extractor.text_entity_extraction(new_chunks)
 
@@ -416,22 +418,6 @@ class MMKGBuilder:
         logger.info(f"ðŸ”— Step 4/5 â€” Graph fusion ({len(img_ids)} image(s) to check)")
         await fusion(img_ids, working_dir=self.working_dir)
 
-    async def _step_sync_graph_snapshot(self):
-        """Make CockroachDB authoritative again after local GraphML fusion."""
-        if not self.workspace_id:
-            return
-        _namespace, graph_path = get_latest_graphml_file(self.working_dir)
-        if not os.path.exists(graph_path):
-            logger.warning("No GraphML snapshot available to sync to CockroachDB")
-            return
-        from .cockroach_graph_storage import CockroachGraphStorage
-
-        storage = CockroachGraphStorage(
-            namespace="chunk_entity_relation",
-            storage_dir=self.working_dir,
-            workspace_id=self.workspace_id,
-        )
-        await storage.replace_from_graphml(graph_path)
 
     async def _step_embeddings(self):
         # Skips silently in local-only mode (no workspace_id, i.e. still on
@@ -440,9 +426,21 @@ class MMKGBuilder:
         if not self.workspace_id:
             return
 
-        from . import cockroach_vector_storage as vector_store
+        from . import embeddings_storage as vector_store
 
-        pending = await vector_store.nodes_missing_embeddings(self.workspace_id)
+        # Load the latest graph
+        _namespace, graph_path = get_latest_graphml_file(self.working_dir)
+        if not os.path.exists(graph_path):
+            logger.info("⭐ No graph found yet, skipping embeddings")
+            return
+
+        # Create a storage instance to load/manipulate the graph
+        graph_storage = NetworkXStorage(
+            namespace="chunk_entity_relation",
+            storage_dir=self.working_dir,
+        )
+
+        pending = await vector_store.nodes_missing_embeddings(self.workspace_id, graph_storage)
         if not pending:
             logger.info("â­ï¸  No new entities need embeddings")
             return
@@ -455,7 +453,10 @@ class MMKGBuilder:
         vectors      = embed_model.encode(descriptions)
 
         for node_id, vector in zip(node_ids, vectors):
-            await vector_store.upsert_embedding(self.workspace_id, node_id, vector)
+            await vector_store.upsert_embedding(self.workspace_id, node_id, vector, graph_storage)
+
+        # Save the updated graph with embeddings
+        await graph_storage.index_done_callback()
 
     async def _step_save_output(self):
         logger.info("ðŸ’¾ Step 5a/5 â€” Saving final graph")

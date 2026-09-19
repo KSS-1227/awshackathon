@@ -1,26 +1,28 @@
-"""CockroachDB-backed conversation memory for workspace GraphRAG sessions."""
-from __future__ import annotations
+"""
+Conversation memory for workspace GraphRAG sessions.
 
-from .cockroach_vector_storage import _get_pool
+STUBBED: CockroachDB backend removed. Multi-turn session history gracefully
+degrades to single-turn behavior — history retrieval returns empty list,
+turn saves return 0 (no persistence).
+
+Call sites in workspace_document_service.py:
+1. get_session_history() → returns [] → if history: evaluates False → single-turn
+2. save_turn() → returns 0 → response includes "turn": 0 (harmless)
+
+No errors thrown, no exceptions. Clean no-op degradation.
+"""
+from __future__ import annotations
 
 
 async def get_session_history(workspace_id: str, session_id: str) -> list[dict[str, str | int]]:
-    """Return prior turns for one workspace/session in chronological order."""
-    pool = await _get_pool()
-    async with pool.connection() as conn:
-        rows = await (await conn.execute(
-            """
-            SELECT turn, question, answer
-            FROM agent_memory
-            WHERE workspace_id = %s AND session_id = %s
-            ORDER BY turn ASC
-            """,
-            (workspace_id, session_id),
-        )).fetchall()
-    return [
-        {"turn": row[0], "question": row[1], "answer": row[2]}
-        for row in rows
-    ]
+    """Return prior turns for one workspace/session.
+    
+    STUBBED: Returns empty list. Multi-turn history unavailable (no CockroachDB).
+    Caller (workspace_document_service.py line ~171) will detect empty history
+    and fall back to single-turn query behavior.
+    """
+    # Return empty list — graceful degradation to single-turn queries
+    return []
 
 
 async def save_turn(
@@ -30,23 +32,11 @@ async def save_turn(
     answer: str,
 ) -> int:
     """Persist a turn and return its per-session sequence number.
-
-    The next turn is calculated immediately before insertion, avoiding the
-    unresolved constant-turn bug that would silently drop every follow-up.
+    
+    STUBBED: Returns 0 (turn not persisted). No CockroachDB backend.
+    Caller (workspace_document_service.py line ~242) will receive 0 and
+    include it in response as "turn": 0 (harmless indicator that session
+    persistence is unavailable).
     """
-    pool = await _get_pool()
-    async with pool.connection() as conn:
-        row = await (await conn.execute(
-            "SELECT COALESCE(MAX(turn), 0) + 1 FROM agent_memory WHERE session_id = %s",
-            (session_id,),
-        )).fetchone()
-        next_turn = int(row[0])
-        await conn.execute(
-            """
-            INSERT INTO agent_memory (workspace_id, session_id, turn, question, answer)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (session_id, turn) DO NOTHING
-            """,
-            (workspace_id, session_id, next_turn, question, answer),
-        )
-    return next_turn
+    # Return 0 — indicate no turn was persisted
+    return 0

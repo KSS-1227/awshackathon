@@ -12,8 +12,7 @@ mismatches and approval-limit violations.
 Design notes
 ------------
 - Pure graph traversal + regex. No LLM calls, so this is fast and deterministic.
-- Graph nodes/edges are read from CockroachDB (workspace-scoped rows), reusing
-  the existing async connection pool from ``backend.cockroach_graph_storage``.
+- Graph nodes/edges are read from the local GraphML file via NetworkXStorage.
 - ``source_files`` are resolved from the local ``kv_store_text_chunks.json`` KV
   store in the workspace ``working`` directory (same store the pipeline writes).
 - The rupee symbol is written as ``\\u20b9`` throughout so this file stays pure
@@ -33,8 +32,8 @@ import logging
 import re
 from pathlib import Path
 
-# Reuse the shared async pool — do NOT open a second connection to CockroachDB.
-from backend.cockroach_graph_storage import _get_pool
+from backend.storage.graph_storage import NetworkXStorage
+from backend.utils.base import get_latest_graphml_file
 from backend.compliance.decision_lineage import LineageRow, persist_lineage
 
 logger = logging.getLogger(__name__)
@@ -116,40 +115,41 @@ class ReconciliationEngine:
     # Data loading
     # ------------------------------------------------------------------
 
-    async def _pool(self):
-        pool = _get_pool()
-        if pool.closed:  # psycopg_pool is created with open=False
-            await pool.open()
-        return pool
-
     async def _load_nodes(self) -> dict[str, dict]:
         """Return ``{node_id: {entity_type, description, source_id}}`` for the workspace."""
-        pool = await self._pool()
-        async with pool.connection() as conn:
-            rows = await (await conn.execute(
-                "SELECT node_id, entity_type, description, source_id "
-                "FROM graph_nodes WHERE workspace_id=%s",
-                (self.workspace_id,),
-            )).fetchall()
-        return {
-            row[0]: {
-                "entity_type": row[1],
-                "description": row[2],
-                "source_id": row[3],
+        # Load graph from GraphML file
+        _namespace, graph_path = get_latest_graphml_file(self.working_dir)
+        if not graph_path:
+            return {}
+        
+        graph_storage = NetworkXStorage(
+            namespace="chunk_entity_relation",
+            storage_dir=self.working_dir,
+        )
+        
+        nodes = {}
+        for node_id, node_data in graph_storage._graph.nodes(data=True):
+            nodes[node_id] = {
+                "entity_type": node_data.get("entity_type"),
+                "description": node_data.get("description"),
+                "source_id": node_data.get("source_id"),
             }
-            for row in rows
-        }
+        return nodes
 
     async def _load_adjacency(self) -> dict[str, set[str]]:
         """Return an undirected adjacency map ``{node_id: {neighbor_id, ...}}``."""
-        pool = await self._pool()
-        async with pool.connection() as conn:
-            rows = await (await conn.execute(
-                "SELECT source_id, target_id FROM graph_edges WHERE workspace_id=%s",
-                (self.workspace_id,),
-            )).fetchall()
+        # Load graph from GraphML file
+        _namespace, graph_path = get_latest_graphml_file(self.working_dir)
+        if not graph_path:
+            return {}
+        
+        graph_storage = NetworkXStorage(
+            namespace="chunk_entity_relation",
+            storage_dir=self.working_dir,
+        )
+        
         adjacency: dict[str, set[str]] = {}
-        for source_id, target_id in rows:
+        for source_id, target_id in graph_storage._graph.edges():
             adjacency.setdefault(source_id, set()).add(target_id)
             adjacency.setdefault(target_id, set()).add(source_id)
         return adjacency
