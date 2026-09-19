@@ -116,12 +116,14 @@ async def upload_document_and_create_job(
     data: bytes,
     content_type: Optional[str] = None,
 ) -> dict:
-    """Upload document to workspace S3 path and create DynamoDB job record.
+    """Upload document to workspace storage and create DynamoDB job record.
     
     Workflow:
     1. Generate job_id (UUID)
     2. Sanitize filename and generate document UUID
-    3. Upload file to S3 at: workspaces/{workspace_id}/documents/{case_id}/{job_id}_{doc_uuid}.{ext}
+    3. Upload file to S3 (if enabled) or local storage (if disabled)
+       S3: workspaces/{workspace_id}/documents/{case_id}/{job_id}_{doc_uuid}.{ext}
+       Local: data/uploads/workspaces/{workspace_id}/documents/{case_id}/{job_id}_{doc_uuid}.{ext}
     4. Create DynamoDB Job record (Item Type 5) with status=pending
     5. Return job metadata
     
@@ -145,7 +147,7 @@ async def upload_document_and_create_job(
     
     Raises:
         ValueError: If workspace_id, case_id, filename, or data is missing
-        S3StorageConfigurationError: If S3 not properly configured
+        S3StorageConfigurationError: If S3 not properly configured (when S3 is enabled)
         ClientError: If DynamoDB or S3 operations fail
     
     Phase 2 TODO: Lambda will receive S3 event via EventBridge, extract job_id from
@@ -175,25 +177,37 @@ async def upload_document_and_create_job(
     # Build S3 key: workspaces/{workspace_id}/documents/{case_id}/{job_id}_{doc_uuid}.{ext}
     s3_key = f"workspaces/{workspace_id}/documents/{case_id}/{job_id}_{doc_uuid}{ext}"
     
-    # Upload to S3
-    bucket = _bucket()
-    
-    def _put() -> None:
-        _client().put_object(
-            Bucket=bucket,
-            Key=s3_key,
-            Body=data,
-            ContentType=content_type or "application/octet-stream",
-            ServerSideEncryption="AES256",
-            Metadata={
-                "job_id": job_id,
-                "workspace_id": workspace_id,
-                "case_id": case_id,
-            },
-        )
-    
-    await asyncio.to_thread(_put)
-    logger.info(f"✅ Uploaded document to S3: {s3_key}")
+    if is_enabled():
+        # S3 enabled: upload to S3
+        bucket = _bucket()
+        
+        def _put() -> None:
+            _client().put_object(
+                Bucket=bucket,
+                Key=s3_key,
+                Body=data,
+                ContentType=content_type or "application/octet-stream",
+                ServerSideEncryption="AES256",
+                Metadata={
+                    "job_id": job_id,
+                    "workspace_id": workspace_id,
+                    "case_id": case_id,
+                },
+            )
+        
+        await asyncio.to_thread(_put)
+        logger.info(f"✅ Uploaded document to S3: {s3_key}")
+    else:
+        # S3 disabled: use local storage at data/uploads/{workspace_id}/documents/{case_id}/...
+        local_path = Path("data/uploads") / s3_key.replace("workspaces/", "")
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        def _write() -> None:
+            with open(local_path, "wb") as f:
+                f.write(data)
+        
+        await asyncio.to_thread(_write)
+        logger.info(f"✅ Saved document locally: {local_path}")
     
     # Create DynamoDB job record (Item Type 5)
     now = int(time.time())
@@ -312,6 +326,9 @@ async def download_from_s3_to_temp(s3_key: str, temp_dir: str = "data/temp") -> 
     This function downloads from S3 and returns the local path.
     The caller is responsible for cleanup via cleanup_temp_file().
     
+    For local testing without S3, stores documents in a local directory structure
+    and retrieves them from there instead.
+    
     Args:
         s3_key: Full S3 key (e.g., "workspaces/ws-123/documents/case-1/job-456_abc123.pdf")
         temp_dir: Directory for temporary files (default: "data/temp")
@@ -320,29 +337,44 @@ async def download_from_s3_to_temp(s3_key: str, temp_dir: str = "data/temp") -> 
         Local file path where the document was downloaded
     
     Raises:
-        S3StorageConfigurationError: If S3 not properly configured
-        FileNotFoundError: If S3 object doesn't exist
+        FileNotFoundError: If document doesn't exist
         IOError: If file write fails
     """
-    if not is_enabled():
-        raise S3StorageConfigurationError("S3 storage is not enabled")
-    
-    bucket = _bucket()
     os.makedirs(temp_dir, exist_ok=True)
     
     # Extract filename from S3 key for local temp file
     filename = Path(s3_key).name
     local_path = str(Path(temp_dir) / filename)
     
-    def _get() -> None:
-        client = _client()
-        try:
-            client.download_file(bucket, s3_key, local_path)
-        except client.exceptions.NoSuchKey as exc:
-            raise FileNotFoundError(f"S3 object not found: {s3_key}") from exc
+    if is_enabled():
+        # S3 enabled: download from S3
+        bucket = _bucket()
+        
+        def _get() -> None:
+            client = _client()
+            try:
+                client.download_file(bucket, s3_key, local_path)
+            except client.exceptions.NoSuchKey as exc:
+                raise FileNotFoundError(f"S3 object not found: {s3_key}") from exc
+        
+        await asyncio.to_thread(_get)
+        logger.info(f"📥 Downloaded from S3: {s3_key} → {local_path}")
+    else:
+        # S3 disabled: use local storage (data/uploads/{workspace_id}/documents/{case_id}/...)
+        # This is for local testing without AWS
+        source_path = str(Path("data/uploads") / s3_key.replace("workspaces/", ""))
+        
+        if not Path(source_path).exists():
+            raise FileNotFoundError(f"Local document not found: {source_path}")
+        
+        # Copy from local source to temp location
+        def _copy() -> None:
+            import shutil
+            shutil.copy(source_path, local_path)
+        
+        await asyncio.to_thread(_copy)
+        logger.info(f"📁 Copied from local: {source_path} → {local_path}")
     
-    await asyncio.to_thread(_get)
-    logger.info(f"? Downloaded from S3: {s3_key} ? {local_path}")
     return local_path
 
 

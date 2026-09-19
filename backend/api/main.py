@@ -26,6 +26,7 @@ from backend.api.routes.workspace_report import router as ws_report_router
 from backend.api.routes.workspace_stats import router as ws_stats_router
 from backend.api.routes.workspace_upload import router as ws_upload_router
 from backend.api.routes.workspace_decisions import router as ws_decisions_router
+from backend.api.routes.workspace_jobs import router as ws_jobs_router
 from backend.auth.middleware.jwt_middleware import _get_jwks, get_current_user
 from backend.auth.routes.audit import router as audit_router
 from backend.auth.routes.auth import router as auth_router
@@ -93,6 +94,7 @@ app.add_middleware(
 # ------------------------------
 
 app.include_router(ws_upload_router, prefix="/api", dependencies=[Depends(get_current_user)])
+app.include_router(ws_jobs_router, prefix="/api", dependencies=[Depends(get_current_user)])
 app.include_router(ws_query_router,  prefix="/api", dependencies=[Depends(get_current_user)])
 app.include_router(ws_graph_router,  prefix="/api", dependencies=[Depends(get_current_user)])
 app.include_router(ws_stats_router,  prefix="/api", dependencies=[Depends(get_current_user)])
