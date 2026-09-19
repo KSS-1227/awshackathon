@@ -33,6 +33,7 @@ from backend.auth.routes.auth import router as auth_router
 from backend.auth.routes.profile import router as profile_router
 from backend.auth.routes.workspace import router as workspace_router
 from backend.config import ALLOWED_ORIGINS, OPENAI_API_KEY, SUPABASE_JWT_SECRET
+from backend.storage.dynamodb_init import initialize_dynamodb
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,29 @@ async def _prewarm_jwks():
         logger.info("JWKS cache pre-warmed successfully")
     except Exception as exc:
         logger.warning("JWKS pre-warm failed (will retry on first request): %s", exc)
+
+
+@app.on_event("startup")
+async def startup_dynamodb():
+    """Verify DynamoDB table exists and is ready on application startup.
+    
+    This startup event ensures the DynamoDB table is properly configured
+    before the application begins processing requests. If the table is
+    missing or not in ACTIVE state, the application will fail fast.
+    
+    Raises:
+        RuntimeError: If DynamoDB table is missing, misconfigured, or not ready
+    """
+    try:
+        logger.info("Verifying DynamoDB table...")
+        ready = await initialize_dynamodb()
+        if ready:
+            logger.info("✓ DynamoDB table is ready")
+        else:
+            raise RuntimeError("DynamoDB table is not in ACTIVE state")
+    except Exception as exc:
+        logger.error(f"✗ Failed to initialize DynamoDB: {exc}")
+        raise
 
 
 # ------------------------------

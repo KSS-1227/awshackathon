@@ -125,3 +125,22 @@ SUPABASE_JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
 
 # Comma-separated list of allowed CORS origins, e.g. "https://app.example.com,https://admin.example.com"
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "")
+
+# ============ DynamoDB Configuration ============
+# DynamoDB table name for storing compliance platform data.
+# Can be customized per environment via DYNAMODB_TABLE_NAME env var.
+DYNAMODB_TABLE_NAME = os.environ.get("DYNAMODB_TABLE_NAME", "compliance-platform")
+
+# AWS region where DynamoDB tables are located.
+# Default: ap-south-1 (Mumbai region)
+# Can be overridden via AWS_REGION env var.
+AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
+
+# AWS access credentials for DynamoDB authentication.
+# Optional: If not provided, IAM role-based authentication will be used.
+# For local development or explicit credential usage, set these via env vars:
+# - AWS_ACCESS_KEY_ID
+# - AWS_SECRET_ACCESS_KEY
+# WARNING: Do NOT hardcode credentials in this file. Always use environment variables.
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", None)
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", None)

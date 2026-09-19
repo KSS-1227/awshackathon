@@ -1,5 +1,5 @@
 """
-Storage package — KV store and graph store abstractions.
+Storage package — KV store, graph store, and DynamoDB abstractions.
 """
 from .graph_storage import (
     BaseGraphStorage,
@@ -11,6 +11,13 @@ from .kv_storage import (
     StorageNameSpace,
     TextChunkSchema,
 )
+from .dynamodb_client import (
+    DynamoDBClient,
+    get_dynamodb_client,
+)
+from .dynamodb_workspaces import (
+    list_workspaces_for_user,
+)
 
 __all__ = [
     "BaseGraphStorage",
@@ -19,4 +26,7 @@ __all__ = [
     "NetworkXStorage",
     "StorageNameSpace",
     "TextChunkSchema",
+    "DynamoDBClient",
+    "get_dynamodb_client",
+    "list_workspaces_for_user",
 ]
