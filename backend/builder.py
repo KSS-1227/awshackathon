@@ -141,7 +141,7 @@ class MMKGBuilder:
         self._mark_processed(file_path)
         logger.info("✅ Knowledge graph build complete")
 
-    async def index_many(self, file_paths: list[str]) -> dict[str, str]:
+    async def index_many(self, file_paths: list[str]) -> tuple[dict[str, str], int, int]:
         """Index multiple files, preprocessing them concurrently.
 
         Preprocessing (file parsing + LLM chunking) runs in parallel for all
@@ -164,10 +164,17 @@ class MMKGBuilder:
 
         Returns
         -------
-        dict mapping filename → "processed" | "skipped" | "failed: <reason>"
+        tuple of (dict[str, str], int, int) where:
+            - dict maps filename → "processed" | "skipped" | "failed: <reason>"
+            - first int is node_count from the final graph
+            - second int is edge_count from the final graph
         """
         if not file_paths:
-            return {}
+            return {}, 0, 0
+
+        # Initialize counters for graph statistics
+        node_count = 0
+        edge_count = 0
 
         # ── Partition: skip already-processed files up front ────────────
         to_process: list[str] = []
@@ -184,7 +191,7 @@ class MMKGBuilder:
 
         if not to_process:
             logger.info("⏭️  All files already indexed, nothing to do")
-            return results
+            return results, node_count, edge_count
 
         logger.info(
             "📂 Batch ingestion — %d file(s) to process (concurrently preprocessing)",
@@ -242,7 +249,7 @@ class MMKGBuilder:
         if processed_count > 0:
             await self._step_embeddings()
             self._step_save_output()
-            self._step_generate_report()
+            node_count, edge_count = self._step_generate_report()
             logger.info(
                 "✅ Batch ingestion complete — %d processed, %d skipped, %d failed",
                 processed_count,
@@ -252,7 +259,7 @@ class MMKGBuilder:
         else:
             logger.warning("⚠️  No files were successfully processed in this batch")
 
-        return results
+        return results, node_count, edge_count
 
     # ------------------------------------------------------------------
     # Document-level tracking
@@ -460,12 +467,12 @@ class MMKGBuilder:
         shutil.copy2(src_path, dest)
         logger.info(f"📦 Graph saved to: {dest}")
 
-    def _step_generate_report(self):
+    def _step_generate_report(self) -> tuple[int, int]:
         logger.info("📊 Step 5b/5 — Generating report")
         import networkx as nx
         graph_path = os.path.join(self.output_dir, f"{self.mmkg_name}.graphml")
         if not os.path.exists(graph_path):
-            return
+            return (0, 0)
         G = nx.read_graphml(graph_path)
         type_counts: dict = {}
         for _, data in G.nodes(data=True):
@@ -483,3 +490,4 @@ class MMKGBuilder:
         with open(report_path, "w", encoding="utf-8") as f:
             f.write("\n".join(report_lines))
         logger.info(f"📋 Report saved to: {report_path}")
+        return G.number_of_nodes(), G.number_of_edges()
