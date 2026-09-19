@@ -135,7 +135,7 @@ class MMKGBuilder:
         await self._step_preprocessing(file_path)
         await self._step_graph_merge(file_path)
         await self._step_embeddings()
-        self._step_save_output()
+        await self._step_save_output()
         self._step_generate_report()
 
         self._mark_processed(file_path)
@@ -248,7 +248,7 @@ class MMKGBuilder:
         processed_count = sum(1 for v in results.values() if v == "processed")
         if processed_count > 0:
             await self._step_embeddings()
-            self._step_save_output()
+            await self._step_save_output()
             node_count, edge_count = self._step_generate_report()
             logger.info(
                 "✅ Batch ingestion complete — %d processed, %d skipped, %d failed",
@@ -457,7 +457,7 @@ class MMKGBuilder:
         for node_id, vector in zip(node_ids, vectors):
             await vector_store.upsert_embedding(self.workspace_id, node_id, vector)
 
-    def _step_save_output(self):
+    async def _step_save_output(self):
         logger.info("💾 Step 5a/5 — Saving final graph")
         _namespace, src_path = get_latest_graphml_file(self.working_dir)
         if not os.path.exists(src_path):
@@ -466,6 +466,22 @@ class MMKGBuilder:
         dest = os.path.join(self.output_dir, f"{self.mmkg_name}.graphml")
         shutil.copy2(src_path, dest)
         logger.info(f"📦 Graph saved to: {dest}")
+        
+        # Upload to S3 if enabled and workspace_id is available
+        if self.workspace_id:
+            try:
+                from backend.storage.s3_graph_storage import upload_graph_to_s3
+                
+                logger.info(f"Uploading graph to S3 for workspace {self.workspace_id}")
+                s3_key = await upload_graph_to_s3(
+                    workspace_id=self.workspace_id,
+                    case_id=self.mmkg_name,
+                    graph_path=dest,
+                )
+                logger.info(f"✅ Graph uploaded to S3: {s3_key}")
+            except Exception as exc:
+                logger.error(f"⚠️  Failed to upload graph to S3: {exc}")
+                # Continue processing even if S3 upload fails (Day 1 keeps local copy)
 
     def _step_generate_report(self) -> tuple[int, int]:
         logger.info("📊 Step 5b/5 — Generating report")
