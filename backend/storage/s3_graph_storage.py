@@ -1,4 +1,4 @@
-"""S3 graph storage for workspace-based MMKG graphs.
+﻿"""S3 graph storage for workspace-based MMKG graphs.
 
 Provides upload/download operations for GraphML files stored in S3.
 
@@ -8,6 +8,7 @@ S3 Key Format:
 All operations check if S3 is enabled before attempting uploads/downloads.
 Falls back gracefully to local disk if S3 is disabled.
 """
+import asyncio
 import logging
 import os
 import shutil
@@ -100,14 +101,18 @@ async def upload_graph_to_s3(
 
         # Upload to S3
         logger.info(f"Uploading graph to S3: s3://{bucket}/{s3_key}")
-        _client().put_object(
-            Bucket=bucket,
-            Key=s3_key,
-            Body=graph_data,
-            ContentType="application/graphml+xml",
-        )
         
-        logger.info(f"✅ Graph uploaded to S3: {s3_key}")
+        def _upload_sync():
+            _client().put_object(
+                Bucket=bucket,
+                Key=s3_key,
+                Body=graph_data,
+                ContentType="application/graphml+xml",
+            )
+        
+        await asyncio.to_thread(_upload_sync)
+        
+        logger.info(f"âœ… Graph uploaded to S3: {s3_key}")
         return s3_key
 
     except Exception as exc:
@@ -159,10 +164,12 @@ async def download_graph_from_s3(
     try:
         logger.info(f"Downloading graph from S3: s3://{bucket}/{s3_key}")
         
-        # Download from S3
-        _client().download_file(bucket, s3_key, temp_path)
+        def _download_sync():
+            _client().download_file(bucket, s3_key, temp_path)
         
-        logger.info(f"✅ Graph downloaded to temp: {temp_path}")
+        await asyncio.to_thread(_download_sync)
+        
+        logger.info(f"âœ… Graph downloaded to temp: {temp_path}")
         return temp_path
 
     except _client().exceptions.NoSuchKey:
@@ -190,3 +197,4 @@ def cleanup_temp_graph(file_path: str) -> bool:
     except Exception as exc:
         logger.warning(f"Failed to clean up temp graph {file_path}: {exc}")
         return False
+
