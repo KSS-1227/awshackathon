@@ -1,7 +1,8 @@
-"""In-memory job tracking for async document processing.
+"""
+Job lifecycle tracking for async document processing via S3 upload.
 
-For production, this would be DynamoDB. For local testing, we use
-an in-memory dict + file-backed persistence.
+Uses DynamoDB for durable persistence via get_dynamodb_client().
+All operations fail loudly if DynamoDB is unreachable — no fallback to in-memory.
 
 Job Item Schema (Item Type 5):
     PK: WORKSPACE#{workspace_id}
@@ -16,56 +17,13 @@ Job Item Schema (Item Type 5):
     s3_key: str (S3 path to document)
     case_id: str
 """
-import asyncio
-import json
 import logging
-import os
 import time
-from pathlib import Path
 from typing import Optional
 
+from .dynamodb_client import get_dynamodb_client
+
 logger = logging.getLogger(__name__)
-
-# In-memory job store: {workspace_id: {job_id: {item}}}
-_jobs: dict[str, dict[str, dict]] = {}
-_jobs_lock = asyncio.Lock()
-
-# Persistence file
-_JOBS_FILE = "data/jobs.json"
-
-
-def _load_jobs_from_disk() -> None:
-    """Load jobs from disk on module init."""
-    global _jobs
-    if Path(_JOBS_FILE).exists():
-        try:
-            with open(_JOBS_FILE, "r") as f:
-                data = json.load(f)
-                # Reconstruct nested dict
-                _jobs = {
-                    ws_id: {jid: item for jid, item in jobs.items()}
-                    for ws_id, jobs in data.items()
-                }
-            logger.info(f"✓ Loaded {sum(len(jobs) for jobs in _jobs.values())} jobs from disk")
-        except Exception as exc:
-            logger.warning(f"Failed to load jobs from disk: {exc}; starting fresh")
-            _jobs = {}
-    else:
-        _jobs = {}
-
-
-def _save_jobs_to_disk() -> None:
-    """Persist jobs to disk."""
-    os.makedirs(Path(_JOBS_FILE).parent, exist_ok=True)
-    try:
-        with open(_JOBS_FILE, "w") as f:
-            json.dump(_jobs, f, indent=2, default=str)
-    except Exception as exc:
-        logger.error(f"Failed to save jobs to disk: {exc}")
-
-
-# Load on import
-_load_jobs_from_disk()
 
 
 async def create_job(
@@ -76,7 +34,7 @@ async def create_job(
     s3_key: str,
     status: str = "pending",
 ) -> dict:
-    """Create a new job record.
+    """Create a new job record in DynamoDB.
     
     Args:
         workspace_id: Workspace ID
@@ -86,28 +44,29 @@ async def create_job(
         status: Initial status (default: "pending")
     
     Returns:
-        Job item dict
+        Job item dict as stored in DynamoDB
+        
+    Raises:
+        Exception: If DynamoDB operation fails
     """
     now = int(time.time())
     
     item = {
+        "PK": f"WORKSPACE#{workspace_id}",
+        "SK": f"JOB#{job_id}",
         "workspace_id": workspace_id,
-        "case_id": case_id,
         "job_id": job_id,
+        "case_id": case_id,
         "s3_key": s3_key,
         "status": status,
         "created_at": now,
         "updated_at": now,
     }
     
-    async with _jobs_lock:
-        if workspace_id not in _jobs:
-            _jobs[workspace_id] = {}
-        _jobs[workspace_id][job_id] = item
-        _save_jobs_to_disk()
-    
+    client = get_dynamodb_client()
+    result = await client.put_item(item)
     logger.info(f"✓ Created job: {job_id} in workspace {workspace_id}")
-    return item
+    return result
 
 
 async def get_job(
@@ -115,7 +74,7 @@ async def get_job(
     workspace_id: str,
     job_id: str,
 ) -> Optional[dict]:
-    """Get a job by workspace_id and job_id.
+    """Get a job by workspace_id and job_id from DynamoDB.
     
     Args:
         workspace_id: Workspace ID
@@ -123,9 +82,22 @@ async def get_job(
     
     Returns:
         Job item dict or None if not found
+        
+    Raises:
+        Exception: If DynamoDB operation fails
     """
-    async with _jobs_lock:
-        return _jobs.get(workspace_id, {}).get(job_id)
+    pk = f"WORKSPACE#{workspace_id}"
+    sk = f"JOB#{job_id}"
+    
+    client = get_dynamodb_client()
+    item = await client.get_item(pk, sk)
+    
+    if item:
+        logger.debug(f"✓ Retrieved job: {job_id} in workspace {workspace_id}")
+    else:
+        logger.debug(f"Job not found: {job_id} in workspace {workspace_id}")
+    
+    return item
 
 
 async def list_jobs(
@@ -135,18 +107,35 @@ async def list_jobs(
 ) -> list[dict]:
     """List all jobs for a workspace, optionally filtered by case_id.
     
+    Queries DynamoDB for all JOB# items under the workspace, then filters
+    by case_id in Python if provided.
+    
     Args:
         workspace_id: Workspace ID
         case_id: Optional case ID filter
     
     Returns:
-        List of job items
+        List of job items sorted by created_at descending (newest first)
+        
+    Raises:
+        Exception: If DynamoDB operation fails
     """
-    async with _jobs_lock:
-        jobs = _jobs.get(workspace_id, {}).values()
-        if case_id:
-            jobs = [j for j in jobs if j.get("case_id") == case_id]
-        return sorted(jobs, key=lambda j: j.get("created_at", 0), reverse=True)
+    pk = f"WORKSPACE#{workspace_id}"
+    sk_prefix = "JOB#"
+    
+    client = get_dynamodb_client()
+    jobs = await client.query(pk, sk_prefix=sk_prefix, limit=1000)
+    
+    # Filter by case_id if provided
+    if case_id:
+        jobs = [j for j in jobs if j.get("case_id") == case_id]
+    
+    # Sort by created_at descending
+    jobs.sort(key=lambda j: j.get("created_at", 0), reverse=True)
+    
+    logger.debug(f"✓ Listed {len(jobs)} jobs for workspace {workspace_id}" +
+                 (f" filtered to case {case_id}" if case_id else ""))
+    return jobs
 
 
 async def update_job_status(
@@ -158,7 +147,7 @@ async def update_job_status(
     relationships_extracted: Optional[int] = None,
     error_message: Optional[str] = None,
 ) -> Optional[dict]:
-    """Update a job's status and optional result data.
+    """Update a job's status and optional result data in DynamoDB.
     
     Args:
         workspace_id: Workspace ID
@@ -170,28 +159,48 @@ async def update_job_status(
     
     Returns:
         Updated job item or None if not found
+        
+    Raises:
+        Exception: If DynamoDB operation fails
     """
-    async with _jobs_lock:
-        job = _jobs.get(workspace_id, {}).get(job_id)
-        if not job:
-            logger.warning(f"Job not found: {job_id} in workspace {workspace_id}")
-            return None
-        
-        job["status"] = status
-        job["updated_at"] = int(time.time())
-        
-        if entities_extracted is not None:
-            job["entities_extracted"] = entities_extracted
-        
-        if relationships_extracted is not None:
-            job["relationships_extracted"] = relationships_extracted
-        
-        if error_message is not None:
-            job["error_message"] = error_message
-        
-        _save_jobs_to_disk()
-        logger.info(f"✓ Updated job {job_id} status to {status}")
-        return job
+    pk = f"WORKSPACE#{workspace_id}"
+    sk = f"JOB#{job_id}"
+    now = int(time.time())
+    
+    # Build update expression and attribute values
+    set_parts = ["#status = :status", "#updated = :updated"]
+    attr_values = {
+        ":status": status,
+        ":updated": now,
+    }
+    attr_names = {
+        "#status": "status",
+        "#updated": "updated_at",
+    }
+    
+    # Add optional fields if provided
+    if entities_extracted is not None:
+        set_parts.append("#entities = :entities")
+        attr_values[":entities"] = entities_extracted
+        attr_names["#entities"] = "entities_extracted"
+    
+    if relationships_extracted is not None:
+        set_parts.append("#relationships = :relationships")
+        attr_values[":relationships"] = relationships_extracted
+        attr_names["#relationships"] = "relationships_extracted"
+    
+    if error_message is not None:
+        set_parts.append("#error = :error")
+        attr_values[":error"] = error_message
+        attr_names["#error"] = "error_message"
+    
+    update_expr = "SET " + ", ".join(set_parts)
+    
+    client = get_dynamodb_client()
+    result = await client.update_item(pk, sk, update_expr, attr_values, attr_names)
+    
+    logger.info(f"✓ Updated job {job_id} status to {status}")
+    return result
 
 
 async def delete_job(
@@ -199,7 +208,7 @@ async def delete_job(
     workspace_id: str,
     job_id: str,
 ) -> bool:
-    """Delete a job record.
+    """Delete a job record from DynamoDB.
     
     Args:
         workspace_id: Workspace ID
@@ -207,22 +216,19 @@ async def delete_job(
     
     Returns:
         True if deleted, False if not found
+        
+    Raises:
+        Exception: If DynamoDB operation fails
     """
-    async with _jobs_lock:
-        if job_id in _jobs.get(workspace_id, {}):
-            del _jobs[workspace_id][job_id]
-            _save_jobs_to_disk()
-            logger.info(f"✓ Deleted job {job_id} from workspace {workspace_id}")
-            return True
-        return False
-
-
-# For testing: clear all jobs
-async def _clear_all_jobs() -> None:
-    """Clear all jobs (for testing only)."""
-    global _jobs
-    async with _jobs_lock:
-        _jobs = {}
-        if Path(_JOBS_FILE).exists():
-            os.remove(_JOBS_FILE)
-        logger.info("✓ Cleared all jobs")
+    pk = f"WORKSPACE#{workspace_id}"
+    sk = f"JOB#{job_id}"
+    
+    client = get_dynamodb_client()
+    was_deleted = await client.delete_item(pk, sk)
+    
+    if was_deleted:
+        logger.info(f"✓ Deleted job {job_id} from workspace {workspace_id}")
+    else:
+        logger.warning(f"Job not found for deletion: {job_id} in workspace {workspace_id}")
+    
+    return was_deleted
