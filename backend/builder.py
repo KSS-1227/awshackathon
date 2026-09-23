@@ -448,10 +448,29 @@ class MMKGBuilder:
         logger.info(f"ðŸ§¬ Step 5c/5 â€” Embedding {len(pending)} new entit{'y' if len(pending)==1 else 'ies'}")
 
         from ..llm import embed_texts
+        from ..config import VECTOR_SEARCH_BACKEND
+        
         node_ids     = [nid for nid, _ in pending]
         descriptions = [desc for _, desc in pending]
         vectors      = await embed_texts(descriptions)
 
+        # Hook: Also index in OpenSearch if enabled
+        if VECTOR_SEARCH_BACKEND == "opensearch":
+            try:
+                from . import opensearch_vectors
+                for node_id, vector in zip(node_ids, vectors):
+                    success = await opensearch_vectors.upsert_vector(
+                        workspace_id=self.workspace_id,
+                        node_id=node_id,
+                        embedding=vector,
+                        metadata={"description": descriptions[node_ids.index(node_id)]},
+                    )
+                    if not success:
+                        logger.warning(f"Failed to index {node_id} in OpenSearch (continuing)")
+            except Exception as e:
+                logger.error(f"OpenSearch indexing failed: {e} (continuing with NetworkX only)")
+
+        # Store in NetworkX (always)
         for node_id, vector in zip(node_ids, vectors):
             await vector_store.upsert_embedding(self.workspace_id, node_id, vector, graph_storage)
 

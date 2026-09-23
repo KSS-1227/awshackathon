@@ -19,6 +19,12 @@ from .dynamodb_workspaces import (
     list_workspaces_for_user,
 )
 
+# OpenSearch is optional — only import if available
+try:
+    from . import opensearch_vectors
+except ImportError:
+    opensearch_vectors = None
+
 __all__ = [
     "BaseGraphStorage",
     "BaseKVStorage",
@@ -29,4 +35,5 @@ __all__ = [
     "DynamoDBClient",
     "get_dynamodb_client",
     "list_workspaces_for_user",
+    "opensearch_vectors",
 ]

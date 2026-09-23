@@ -56,7 +56,33 @@ class GraphRAGQuery:
 
     async def find_similar_nodes(self, query: str, top_k: int = 5):
         from ..llm import embed_texts
+        from ..config import VECTOR_SEARCH_BACKEND
+        
         q_emb = (await embed_texts([query]))[0]
+        
+        # Route to OpenSearch if enabled, fallback to NetworkX
+        if VECTOR_SEARCH_BACKEND == "opensearch":
+            try:
+                from ..storage import opensearch_vectors
+                results = await opensearch_vectors.search_similar(
+                    workspace_id=self.workspace_id,
+                    query_embedding=q_emb,
+                    k=top_k,
+                )
+                if results:
+                    return results
+                else:
+                    # OpenSearch returned empty, fall back to NetworkX
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning("OpenSearch search returned empty, falling back to NetworkX")
+            except Exception as e:
+                # OpenSearch failed, fall back to NetworkX
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"OpenSearch search failed: {e}, falling back to NetworkX")
+        
+        # Default: NetworkX brute-force
         return await vector_store.top_k_similar(self.workspace_id, q_emb, self.graph_storage, k=top_k)
 
     def _find_most_related_text_unit_from_entities(self, node_datas):

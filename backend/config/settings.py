@@ -131,3 +131,13 @@ AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
 # WARNING: Do NOT hardcode credentials in this file. Always use environment variables.
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", None)
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", None)
+
+# ============ Vector Search Backend Configuration ============
+# Controls where vector similarity search is performed.
+# Options: "networkx" (default, brute-force cosine in Python)
+#          "opensearch" (fast k-NN via Amazon OpenSearch)
+# 
+# When set to "opensearch", embeddings are indexed in OpenSearch for fast retrieval
+# while still being stored in NetworkX node attributes for portability.
+# Default is "networkx" to maintain existing behavior unless explicitly enabled.
+VECTOR_SEARCH_BACKEND = os.environ.get("VECTOR_SEARCH_BACKEND", "networkx").lower()

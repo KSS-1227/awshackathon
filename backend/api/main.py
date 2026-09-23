@@ -15,7 +15,6 @@ from fastapi.middleware.cors import CORSMiddleware
 # Load environment variables (override=True ensures .env always wins over stale shell env vars)
 load_dotenv(override=True)
 
-from backend.api.routes.cases import router as cases_router
 from backend.api.routes.reconciliation import router as reconciliation_router
 from backend.api.routes.storage import router as storage_router
 from backend.api.routes.workspace_graph import router as ws_graph_router
@@ -101,11 +100,6 @@ app.include_router(ws_graph_router,  prefix="/api", dependencies=[Depends(get_cu
 app.include_router(ws_stats_router,  prefix="/api", dependencies=[Depends(get_current_user)])
 app.include_router(
     ws_report_router,
-    prefix="/api",
-    dependencies=[Depends(get_current_user)],
-)
-app.include_router(
-    cases_router,
     prefix="/api",
     dependencies=[Depends(get_current_user)],
 )
