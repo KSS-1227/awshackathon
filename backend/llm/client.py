@@ -1,45 +1,59 @@
 """
-LLM and multimodal LLM client — async/sync wrappers with KV caching.
-AWS Bedrock backend: Amazon Nova Pro for all text/vision, Titan Text V2 for embeddings.
+LLM and multimodal LLM client — provider-branched (Bedrock/Gemini/OpenAI-compatible).
 
-Model architecture (two models, one client pool):
-  1. apac.amazon.nova-pro-v1:0  — all text inference (Converse API) AND vision
-     inference (Converse API with image block).  Used by model_if_cache(),
-     multimodel_if_cache(), get_llm_response(), get_mmllm_response().
-  2. amazon.titan-embed-text-v2:0 — 1024-dim embeddings (InvokeModel API).
-     Used by embed_texts() / local_embedding().  Different API, different
-     model, same boto3 bedrock-runtime client.
+Supports multiple LLM backends:
+  - Bedrock (AWS): Nova Pro for text/vision, Titan for embeddings (legacy)
+  - Gemini (Google): via OpenAI-compatible endpoint, text-embedding-004 for embeddings (default, free tier)
+  - OpenAI-compatible: Any provider with OpenAI API (e.g., local LM Studio)
 
-Bedrock boto3 is synchronous; all calls run in asyncio.run_in_executor()
-so the FastAPI event loop is never blocked.
+Provider branching:
+  - LLM_PROVIDER: text LLM backend (default: "gemini")
+  - MM_PROVIDER: vision LLM backend (default: "gemini", can differ for dual accounts)
+  - EMBEDDING_PROVIDER: embeddings backend (default: "gemini")
+
+All calls are async via asyncio.run_in_executor() so FastAPI event loop is never blocked.
 """
 import ast
 import asyncio
+import base64
 import json
+import logging
 import re
 from typing import Any
 
 import boto3
+import httpx
 import numpy as np
 from botocore.exceptions import ClientError
 
 from ..config.settings import (
+    AWS_REGION,
     BEDROCK_EMBED_DIMENSIONS,
     BEDROCK_EMBED_MODEL_ID,
     BEDROCK_MM_MODEL_ID,
     BEDROCK_TEXT_MODEL_ID,
-    AWS_REGION,
+    EMBEDDING_API_BASE,
+    EMBEDDING_API_KEY,
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_MODEL_NAME,
+    EMBEDDING_PROVIDER,
+    LLM_API_BASE,
+    LLM_API_KEY,
+    LLM_MODEL_NAME,
+    LLM_PROVIDER,
+    MM_API_BASE,
+    MM_API_KEY,
+    MM_MODEL_NAME,
+    MM_PROVIDER,
 )
 from ..storage.kv_storage import BaseKVStorage
 from ..utils.base import compute_args_hash, logger, wrap_embedding_func_with_attrs
 
 # ============================================================================
-# Singleton Bedrock client pool
-# Two logical slots but both point to the same bedrock-runtime endpoint.
-# "embed" is kept separate so it can be routed differently if needed.
+# Singleton Bedrock client pool (for LLM_PROVIDER=bedrock fallback)
 # ============================================================================
 
-_CLIENTS: dict[str, Any] = {
+_BEDROCK_CLIENTS: dict[str, Any] = {
     "text": None,
     "mm": None,
     "embed": None,
@@ -47,59 +61,86 @@ _CLIENTS: dict[str, Any] = {
 
 
 def _get_bedrock_client(is_multimodal: bool = False):
-    """Return singleton boto3 bedrock-runtime client for inference (synchronous)."""
+    """Return singleton boto3 bedrock-runtime client."""
     key = "mm" if is_multimodal else "text"
-    if _CLIENTS[key] is None:
-        _CLIENTS[key] = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+    if _BEDROCK_CLIENTS[key] is None:
+        _BEDROCK_CLIENTS[key] = boto3.client("bedrock-runtime", region_name=AWS_REGION)
         logger.info(
-            "✓ Bedrock inference client initialised (region=%s, model=%s)",
+            "✓ Bedrock inference client initialized (region=%s, model=%s)",
             AWS_REGION,
             BEDROCK_MM_MODEL_ID if is_multimodal else BEDROCK_TEXT_MODEL_ID,
         )
-    return _CLIENTS[key]
+    return _BEDROCK_CLIENTS[key]
 
 
-def _get_embed_client():
-    """Return singleton boto3 bedrock-runtime client for Titan embeddings (synchronous)."""
-    if _CLIENTS["embed"] is None:
-        _CLIENTS["embed"] = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+def _get_bedrock_embed_client():
+    """Return singleton boto3 bedrock-runtime client for embeddings."""
+    if _BEDROCK_CLIENTS["embed"] is None:
+        _BEDROCK_CLIENTS["embed"] = boto3.client("bedrock-runtime", region_name=AWS_REGION)
         logger.info(
-            "✓ Bedrock embed client initialised (region=%s, model=%s)",
+            "✓ Bedrock embed client initialized (region=%s, model=%s)",
             AWS_REGION,
             BEDROCK_EMBED_MODEL_ID,
         )
-    return _CLIENTS["embed"]
+    return _BEDROCK_CLIENTS["embed"]
 
 
 # ============================================================================
-# Rate-limit / throttle retry helper
+# OpenAI-compatible client helper (for LLM_PROVIDER=gemini/openai)
 # ============================================================================
 
-async def _with_retry(async_fn, max_retries: int = 6, base_delay: float = 10.0):
-    """Exponential backoff on Bedrock ThrottlingException.
-
-    All other ClientErrors are re-raised immediately so callers see the
-    real error rather than waiting through 6 retries on a bad model ID.
-    """
-    for attempt in range(max_retries + 1):
-        try:
-            return await async_fn()
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code", "")
-            if code != "ThrottlingException":
-                raise
-            if attempt == max_retries:
-                raise
-            wait = min(base_delay * (2 ** attempt), 120.0)
+async def _call_openai_compatible(
+    api_key: str,
+    api_base: str,
+    model: str,
+    messages: list[dict],
+    system: str | None = None,
+    max_tokens: int = 4096,
+    is_vision: bool = False,
+) -> str:
+    """Generic OpenAI-compatible API call (works with Gemini, OpenAI, etc.)."""
+    if not api_key:
+        raise ValueError(f"API key missing for {api_base}")
+    
+    # Prepend system message if provided
+    if system:
+        messages = [{"role": "system", "content": system}] + messages
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    
+    # Add temperature for more deterministic responses
+    payload["temperature"] = 0.7
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        url = f"{api_base.rstrip('/')}/chat/completions"
+        response = await client.post(url, json=payload, headers=headers)
+        
+        if response.status_code != 200:
+            # Log error details
+            error_body = response.text
             logger.warning(
-                "Bedrock throttled (attempt %d/%d) — retrying in %.1fs",
-                attempt + 1, max_retries, wait,
+                "API error %d for %s: %s",
+                response.status_code,
+                url,
+                error_body[:200],
             )
-            await asyncio.sleep(wait)
+        
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
 
 
 # ============================================================================
-# Shared Bedrock Converse helper — Nova Pro uses Converse API, not invoke_model
+# Bedrock Converse helper (legacy)
 # ============================================================================
 
 def _converse_bedrock(
@@ -109,11 +150,7 @@ def _converse_bedrock(
     system: str | None,
     max_tokens: int,
 ) -> str:
-    """Synchronous Bedrock Converse call. Runs inside run_in_executor.
-
-    Nova Pro uses the Converse API (not invoke_model with anthropic_version).
-    Messages must use the Converse content-block format.
-    """
+    """Synchronous Bedrock Converse call."""
     kwargs: dict = {
         "modelId": model_id,
         "messages": messages,
@@ -126,17 +163,219 @@ def _converse_bedrock(
 
 
 # ============================================================================
-# Embeddings — Amazon Titan Text Embeddings V2 (InvokeModel, not Converse)
-# 1024-dim, normalised, via invoke_model with {"inputText": ..., "dimensions": 1024}
+# Rate-limit / throttle retry helper
+# ============================================================================
+
+async def _with_retry(async_fn, max_retries: int = 3, base_delay: float = 1.0):
+    """Exponential backoff for transient errors."""
+    for attempt in range(max_retries + 1):
+        try:
+            return await async_fn()
+        except (httpx.HTTPError, ClientError) as exc:
+            if attempt == max_retries:
+                raise
+            wait = min(base_delay * (2 ** attempt), 30.0)
+            logger.warning(
+                "Request failed (attempt %d/%d) — retrying in %.1fs: %s",
+                attempt + 1, max_retries, wait, str(exc)[:100],
+            )
+            await asyncio.sleep(wait)
+
+
+# ============================================================================
+# Text LLM — Provider-branched (Bedrock/Gemini/OpenAI-compatible)
+# ============================================================================
+
+async def model_if_cache(
+    prompt: str,
+    system_prompt: str | None = None,
+    history_messages: list[dict] | None = None,
+    **kwargs,
+) -> str:
+    """Text LLM call with optional KV caching. Supports multiple providers."""
+    if history_messages is None:
+        history_messages = []
+
+    hashing_kv: BaseKVStorage | None = kwargs.pop("hashing_kv", None)
+    max_tokens: int = kwargs.get("max_tokens", 2048)  # Increased from 4096 for Gemini thinking tokens
+
+    messages = [
+        *history_messages,
+        {"role": "user", "content": prompt},
+    ]
+
+    cache_key = f"{LLM_PROVIDER}:{LLM_MODEL_NAME}"
+    args_hash = None
+    if hashing_kv:
+        args_hash = compute_args_hash(cache_key, messages)
+        cached = await hashing_kv.get_by_id(args_hash)
+        if cached:
+            return cached["return"]
+
+    async def _call():
+        if LLM_PROVIDER == "bedrock":
+            # Convert to Bedrock Converse format
+            client = _get_bedrock_client(is_multimodal=False)
+            loop = asyncio.get_event_loop()
+            bedrock_messages = [
+                {"role": "user", "content": [{"text": m["content"]}]} if m["role"] == "user" else
+                {"role": "assistant", "content": [{"text": m["content"]}]}
+                for m in messages
+            ]
+            return await loop.run_in_executor(
+                None,
+                lambda: _converse_bedrock(client, BEDROCK_TEXT_MODEL_ID, bedrock_messages, system_prompt, max_tokens),
+            )
+        else:  # gemini, openai, or other OpenAI-compatible
+            return await _call_openai_compatible(
+                api_key=LLM_API_KEY,
+                api_base=LLM_API_BASE,
+                model=LLM_MODEL_NAME,
+                messages=messages,
+                system=system_prompt,
+                max_tokens=max_tokens,
+            )
+
+    content = await _with_retry(_call)
+
+    if hashing_kv and args_hash:
+        await hashing_kv.upsert({args_hash: {"return": content, "model": cache_key}})
+        await hashing_kv.index_done_callback()
+
+    return content
+
+
+async def get_llm_response(cur_prompt: str, system_content: str) -> str:
+    """Async text LLM call — used by fusion helpers."""
+    return await model_if_cache(cur_prompt, system_content)
+
+
+# ============================================================================
+# Multimodal/Vision LLM — Provider-branched (Bedrock/Gemini/OpenAI-compatible)
+# ============================================================================
+
+async def multimodel_if_cache(
+    user_prompt: str,
+    img_base: str,
+    system_prompt: str,
+    history_messages: list[dict] | None = None,
+    **kwargs,
+) -> str:
+    """Vision LLM call with optional KV caching. Supports multiple providers."""
+    if history_messages is None:
+        history_messages = []
+
+    hashing_kv: BaseKVStorage | None = kwargs.pop("hashing_kv", None)
+    max_tokens: int = kwargs.get("max_tokens", 4096)  # Increased from 4096 to 4096 for Gemini thinking tokens in vision
+
+    cache_key = f"{MM_PROVIDER}:{MM_MODEL_NAME}"
+    args_hash = None
+    if hashing_kv:
+        # Hash on text parts only — bytes not easily hashable
+        hash_messages = [*history_messages, {"role": "user", "content": user_prompt}]
+        args_hash = compute_args_hash(cache_key, hash_messages)
+        cached = await hashing_kv.get_by_id(args_hash)
+        if cached:
+            return cached["return"]
+
+    async def _call():
+        if MM_PROVIDER == "bedrock":
+            # Bedrock needs base64 decoded to bytes
+            img_bytes = base64.b64decode(img_base)
+            bedrock_messages = [
+                *[
+                    {
+                        "role": "user",
+                        "content": [{"text": m.get("content", "")}]
+                    } if m["role"] == "user" else
+                    {
+                        "role": "assistant",
+                        "content": [{"text": m.get("content", "")}]
+                    }
+                    for m in history_messages
+                ],
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "image": {
+                                "format": "jpeg",
+                                "source": {"bytes": img_bytes},
+                            },
+                        },
+                        {"text": user_prompt},
+                    ],
+                },
+            ]
+            client = _get_bedrock_client(is_multimodal=True)
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: _converse_bedrock(client, BEDROCK_MM_MODEL_ID, bedrock_messages, system_prompt, max_tokens),
+            )
+        else:  # gemini, openai, or other OpenAI-compatible
+            # OpenAI-compatible needs image as data URL
+            # Detect image format from base64 data (PNG starts with iVBORw, JPEG with /9j/)
+            if img_base.startswith("iVBORw"):
+                mime_type = "image/png"
+            elif img_base.startswith("/9j/"):
+                mime_type = "image/jpeg"
+            else:
+                mime_type = "image/jpeg"  # Default to JPEG
+            
+            messages = [
+                *history_messages,
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{img_base}",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": user_prompt,
+                        },
+                    ],
+                },
+            ]
+            return await _call_openai_compatible(
+                api_key=MM_API_KEY,
+                api_base=MM_API_BASE,
+                model=MM_MODEL_NAME,
+                messages=messages,
+                system=system_prompt,
+                max_tokens=max_tokens,
+                is_vision=True,
+            )
+
+    content = await _with_retry(_call)
+
+    if hashing_kv and args_hash:
+        await hashing_kv.upsert({args_hash: {"return": content, "model": cache_key}})
+        await hashing_kv.index_done_callback()
+
+    return content
+
+
+async def get_mmllm_response(cur_prompt: str, system_content: str, img_base: str) -> str:
+    """Async vision LLM call — used by image_utils helpers."""
+    return await multimodel_if_cache(cur_prompt, img_base, system_content)
+
+
+# ============================================================================
+# Embeddings — Provider-branched (Bedrock Titan / Gemini text-embedding-004)
 # ============================================================================
 
 def _invoke_titan_embed(texts: list[str]) -> np.ndarray:
-    """Synchronous batch embedding call to Titan Text V2. Runs in executor."""
-    client = _get_embed_client()
+    """Synchronous batch embedding call to Bedrock Titan Text V2."""
+    client = _get_bedrock_embed_client()
     vectors = []
     for text in texts:
         body = json.dumps({
-            "inputText": text[:8000],   # Titan V2 max input length
+            "inputText": text[:8000],
             "dimensions": BEDROCK_EMBED_DIMENSIONS,
             "normalize": True,
         })
@@ -151,186 +390,67 @@ def _invoke_titan_embed(texts: list[str]) -> np.ndarray:
     return np.array(vectors, dtype=np.float32)
 
 
+async def _call_gemini_embed(texts: list[str]) -> np.ndarray:
+    """Async embedding call to Gemini via native API (not OpenAI-compatible)."""
+    if not EMBEDDING_API_KEY:
+        raise ValueError("EMBEDDING_API_KEY not configured")
+    
+    # Gemini embeddings use native API, not OpenAI-compatible endpoint
+    # Format: https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBEDDING_MODEL_NAME}:embedContent?key={EMBEDDING_API_KEY}"
+    
+    headers = {
+        "Content-Type": "application/json",
+    }
+    
+    vectors = []
+    for text in texts:
+        # Gemini native API format
+        payload = {
+            "content": {
+                "parts": [{"text": text[:8192]}],  # Gemini embeddings support up to 8192 tokens
+            },
+            "output_dimensionality": EMBEDDING_DIMENSIONS,
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            # Gemini native format: data["embedding"]["values"]
+            vectors.append(data["embedding"]["values"])
+    
+    return np.array(vectors, dtype=np.float32)
+
+
 async def embed_texts(texts: list[str]) -> np.ndarray:
-    """Async wrapper — runs Titan embed in executor, returns (N, 1024) float32 array."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: _invoke_titan_embed(texts))
+    """Provider-branched embedding call. Returns (N, embedding_dim) float32 array."""
+    if EMBEDDING_PROVIDER == "bedrock":
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: _invoke_titan_embed(texts))
+    elif EMBEDDING_PROVIDER in ("gemini", "openai"):
+        return await _call_gemini_embed(texts)
+    else:
+        raise ValueError(f"Unknown EMBEDDING_PROVIDER: {EMBEDDING_PROVIDER}")
 
 
-# local_embedding keeps the same decorator signature so callers using
-# wrap_embedding_func_with_attrs (e.g. text2graph) still work unchanged.
+# Dynamically set embedding_dim based on provider
+_EMBEDDING_DIM = EMBEDDING_DIMENSIONS if EMBEDDING_PROVIDER == "gemini" else BEDROCK_EMBED_DIMENSIONS
+_MAX_TOKEN_SIZE = 2048 if EMBEDDING_PROVIDER == "gemini" else 8000
+
 @wrap_embedding_func_with_attrs(
-    embedding_dim=BEDROCK_EMBED_DIMENSIONS,
-    max_token_size=8000,
+    embedding_dim=_EMBEDDING_DIM,
+    max_token_size=_MAX_TOKEN_SIZE,
 )
 async def local_embedding(texts: list[str]) -> np.ndarray:
-    """Drop-in replacement for the old SentenceTransformer local_embedding.
-
-    Calls Titan Text Embeddings V2 via Bedrock.  Returns (N, 1024) float32.
-    The @wrap_embedding_func_with_attrs decorator exposes .embedding_dim and
-    .max_token_size for callers that inspect those attributes.
+    """Provider-branched embedding function.
+    
+    Returns:
+        (N, embedding_dim) float32 array where embedding_dim depends on EMBEDDING_PROVIDER:
+        - Gemini: 768-dim
+        - Bedrock Titan: 1024-dim
     """
     return await embed_texts(texts)
-
-
-# ============================================================================
-# Text LLM — Amazon Nova Pro via Bedrock Converse API
-# ============================================================================
-
-async def model_if_cache(
-    prompt: str,
-    system_prompt: str | None = None,
-    history_messages: list[dict] | None = None,
-    **kwargs,
-) -> str:
-    """Text LLM call with optional KV caching. Identical interface to OpenAI version."""
-    if history_messages is None:
-        history_messages = []
-
-    hashing_kv: BaseKVStorage | None = kwargs.pop("hashing_kv", None)
-    max_tokens: int = kwargs.get("max_tokens", 4096)
-
-    # Convert to Converse message format
-    messages = [
-        *history_messages,
-        {"role": "user", "content": [{"text": prompt}]},
-    ]
-
-    args_hash = None
-    if hashing_kv:
-        args_hash = compute_args_hash(BEDROCK_TEXT_MODEL_ID, messages)
-        cached = await hashing_kv.get_by_id(args_hash)
-        if cached:
-            return cached["return"]
-
-    async def _call():
-        client = _get_bedrock_client(is_multimodal=False)
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: _converse_bedrock(client, BEDROCK_TEXT_MODEL_ID, messages, system_prompt, max_tokens),
-        )
-
-    content = await _with_retry(_call)
-
-    if hashing_kv and args_hash:
-        await hashing_kv.upsert({args_hash: {"return": content, "model": BEDROCK_TEXT_MODEL_ID}})
-        await hashing_kv.index_done_callback()
-
-    return content
-
-
-async def get_llm_response(cur_prompt: str, system_content: str) -> str:
-    """Async text LLM call — used by fusion helpers."""
-    messages = [{"role": "user", "content": [{"text": cur_prompt}]}]
-
-    async def _call():
-        client = _get_bedrock_client(is_multimodal=False)
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: _converse_bedrock(client, BEDROCK_TEXT_MODEL_ID, messages, system_content, 4096),
-        )
-
-    return await _with_retry(_call)
-
-
-# ============================================================================
-# Multimodal LLM — Amazon Nova Pro vision via Bedrock Converse API
-# ============================================================================
-
-async def multimodel_if_cache(
-    user_prompt: str,
-    img_base: str,
-    system_prompt: str,
-    history_messages: list[dict] | None = None,
-    **kwargs,
-) -> str:
-    """Vision LLM call with optional KV caching.
-
-    img_base must be a base64-encoded JPEG string (no data-URI prefix).
-    Nova Pro Converse image block uses bytes directly — we decode from base64
-    before passing to boto3 which re-encodes internally.
-    """
-    if history_messages is None:
-        history_messages = []
-
-    hashing_kv: BaseKVStorage | None = kwargs.pop("hashing_kv", None)
-    max_tokens: int = kwargs.get("max_tokens", 4096)
-
-    import base64 as _b64
-    img_bytes = _b64.b64decode(img_base)
-
-    user_message = {
-        "role": "user",
-        "content": [
-            {
-                "image": {
-                    "format": "jpeg",
-                    "source": {"bytes": img_bytes},
-                },
-            },
-            {"text": user_prompt},
-        ],
-    }
-    messages = [*history_messages, user_message]
-
-    args_hash = None
-    if hashing_kv:
-        # Hash on text parts only — bytes not hashable by compute_args_hash
-        hash_messages = [
-            *history_messages,
-            {"role": "user", "content": [{"text": user_prompt}]},
-        ]
-        args_hash = compute_args_hash(BEDROCK_MM_MODEL_ID, hash_messages)
-        cached = await hashing_kv.get_by_id(args_hash)
-        if cached:
-            return cached["return"]
-
-    async def _call():
-        client = _get_bedrock_client(is_multimodal=True)
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: _converse_bedrock(client, BEDROCK_MM_MODEL_ID, messages, system_prompt, max_tokens),
-        )
-
-    content = await _with_retry(_call)
-
-    if hashing_kv and args_hash:
-        await hashing_kv.upsert({args_hash: {"return": content, "model": BEDROCK_MM_MODEL_ID}})
-        await hashing_kv.index_done_callback()
-
-    return content
-
-
-async def get_mmllm_response(cur_prompt: str, system_content: str, img_base: str) -> str:
-    """Async vision LLM call — used by image_utils helpers."""
-    import base64 as _b64
-    img_bytes = _b64.b64decode(img_base)
-
-    user_message = {
-        "role": "user",
-        "content": [
-            {
-                "image": {
-                    "format": "jpeg",
-                    "source": {"bytes": img_bytes},
-                },
-            },
-            {"text": cur_prompt},
-        ],
-    }
-
-    async def _call():
-        client = _get_bedrock_client(is_multimodal=True)
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: _converse_bedrock(client, BEDROCK_MM_MODEL_ID, [user_message], system_content, 4096),
-        )
-
-    return await _with_retry(_call)
 
 
 # ============================================================================
