@@ -6,14 +6,15 @@ indexed in Amazon OpenSearch for fast k-NN retrieval, while still being stored i
 NetworkX node attributes for portability.
 
 OpenSearch Domain Configuration:
-- Endpoint: https://search-personal-project-vectors-ob6mlmv336fe3bptbg3o5idyf4.ap-south-1.es.amazonaws.com
-- Region: ap-south-1
+- Endpoint: OPENSEARCH_ENDPOINT env var
+- Region: OPENSEARCH_REGION env var
 - Auth: IAM-based (SigV4)
-- Index: k-NN enabled, 1024 dimensions (Titan Text Embeddings V2)
+- Index: k-NN enabled, dimensions from EMBEDDING_DIMENSIONS setting
 - Engine: faiss (fast cosine similarity)
 """
 import json
 import logging
+import os
 from typing import Optional
 
 import boto3
@@ -23,13 +24,20 @@ from requests_aws4auth import AWS4Auth
 
 logger = logging.getLogger(__name__)
 
-# OpenSearch configuration
-_OPENSEARCH_ENDPOINT = "https://search-personal-project-vectors-ob6mlmv336fe3bptbg3o5idyf4.ap-south-1.es.amazonaws.com"
-_OPENSEARCH_REGION = "ap-south-1"
-_OPENSEARCH_INDEX_NAME = "compliance-platform-vectors"
-_OPENSEARCH_VECTOR_DIM = 1024
+# OpenSearch configuration — read from env vars with defaults
+_OPENSEARCH_ENDPOINT = os.environ.get(
+    "OPENSEARCH_ENDPOINT",
+    "https://search-personal-project-vectors-ob6mlmv336fe3bptbg3o5idyf4.ap-south-1.es.amazonaws.com"
+)
+_OPENSEARCH_REGION = os.environ.get("OPENSEARCH_REGION", "ap-south-1")
+_OPENSEARCH_INDEX_NAME = os.environ.get("OPENSEARCH_INDEX_NAME", "compliance-platform-vectors")
+
+# Get embedding dimension from settings (supports both Gemini 768 and Bedrock Titan 1024)
+from ..config import EMBEDDING_DIMENSIONS
+_OPENSEARCH_VECTOR_DIM = EMBEDDING_DIMENSIONS
 
 _OPENSEARCH_SESSION: Optional[requests.Session] = None
+_INDEX_CREATED = False  # Track if we've attempted index creation
 
 
 def get_opensearch_session() -> requests.Session:
@@ -65,12 +73,41 @@ def get_opensearch_session() -> requests.Session:
     _OPENSEARCH_SESSION.headers.update({"Content-Type": "application/json"})
     
     logger.info(
-        "✓ OpenSearch session initialized (region=%s, index=%s)",
+        "✓ OpenSearch session initialized (region=%s, index=%s, dims=%d)",
         _OPENSEARCH_REGION,
         _OPENSEARCH_INDEX_NAME,
+        _OPENSEARCH_VECTOR_DIM,
     )
     
     return _OPENSEARCH_SESSION
+
+
+async def delete_index() -> bool:
+    """
+    Delete existing OpenSearch index.
+    
+    Use before recreating index with new dimension or schema.
+    """
+    try:
+        session = get_opensearch_session()
+        url = f"{_OPENSEARCH_ENDPOINT}/{_OPENSEARCH_INDEX_NAME}"
+        
+        resp = session.delete(url, verify=True)
+        
+        if resp.status_code in (200, 404):  # 404 = already deleted
+            if resp.status_code == 200:
+                logger.info("✓ OpenSearch index '%s' deleted successfully", _OPENSEARCH_INDEX_NAME)
+                logger.debug("Delete response: %s", resp.json())
+            else:
+                logger.info("Index '%s' does not exist (nothing to delete)", _OPENSEARCH_INDEX_NAME)
+            return True
+        else:
+            logger.error("✗ Failed to delete index: %s %s", resp.status_code, resp.text)
+            return False
+        
+    except Exception as e:
+        logger.error("✗ Failed to delete OpenSearch index: %s", e)
+        return False
 
 
 async def create_index() -> bool:
@@ -79,7 +116,7 @@ async def create_index() -> bool:
     
     Index config:
     - Engine: faiss
-    - Vector dimension: 1024
+    - Vector dimension: EMBEDDING_DIMENSIONS (768 for Gemini, 1024 for Bedrock Titan)
     - Space type: cosine
     """
     try:
@@ -90,11 +127,9 @@ async def create_index() -> bool:
         resp = session.head(url, verify=True)
         
         if resp.status_code == 200:
-            # Index exists — delete and recreate to apply new schema
-            logger.info("Index exists, recreating with new schema...")
-            resp = session.delete(url, verify=True)
-            if resp.status_code != 200:
-                logger.warning("Failed to delete existing index: %s", resp.text)
+            # Index exists — skip creation
+            logger.info("Index '%s' already exists, skipping creation", _OPENSEARCH_INDEX_NAME)
+            return True
         
         # Create index with correct schema
         index_body = {
@@ -123,7 +158,11 @@ async def create_index() -> bool:
         )
         
         if resp.status_code in (200, 201):
-            logger.info("✓ OpenSearch index '%s' created successfully", _OPENSEARCH_INDEX_NAME)
+            logger.info(
+                "✓ OpenSearch index '%s' created successfully (dimension=%d)",
+                _OPENSEARCH_INDEX_NAME,
+                _OPENSEARCH_VECTOR_DIM,
+            )
             logger.debug("Index creation response: %s", resp.json())
             return True
         else:
@@ -147,12 +186,14 @@ async def upsert_vector(
     Parameters:
         workspace_id: Workspace scope
         node_id: Unique node identifier
-        embedding: 1024-dim float32 numpy array
+        embedding: float32 numpy array (dimension from EMBEDDING_DIMENSIONS setting)
         metadata: Optional metadata dict
     
     Returns:
         True on success, False on error.
     """
+    global _INDEX_CREATED
+    
     if embedding.shape[0] != _OPENSEARCH_VECTOR_DIM:
         logger.error(
             "✗ Invalid embedding dimension: expected %d, got %d",
@@ -160,6 +201,12 @@ async def upsert_vector(
             embedding.shape[0],
         )
         return False
+    
+    # Ensure index exists on first upsert
+    if not _INDEX_CREATED:
+        logger.info("First upsert: ensuring index exists...")
+        await create_index()
+        _INDEX_CREATED = True
     
     try:
         session = get_opensearch_session()
@@ -215,7 +262,7 @@ async def search_similar(
     
     Parameters:
         workspace_id: Workspace scope (filter to this workspace)
-        query_embedding: 1024-dim float32 query vector
+        query_embedding: float32 query vector (dimension from EMBEDDING_DIMENSIONS setting)
         k: Number of results to return
     
     Returns:
