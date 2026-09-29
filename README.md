@@ -862,9 +862,3 @@ The backend exposes a full suite of REST endpoints guarded by JWT authentication
 - **Check API status**: `curl http://localhost:8000/health`
 - **Review OpenAPI docs**: `http://localhost:8000/docs` (FastAPI Swagger UI)
 - **Inspect network**: Use browser DevTools or `curl` to check backend responses
-
----
-
-
-
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
