@@ -861,4 +861,4 @@ The backend exposes a full suite of REST endpoints guarded by JWT authentication
 - **See logs**: Run with `-v` flag for verbose output: `python main.py -i doc.pdf -v`
 - **Check API status**: `curl http://localhost:8000/health`
 - **Review OpenAPI docs**: `http://localhost:8000/docs` (FastAPI Swagger UI)
-- **Inspect network**: Use browser DevTools or `curl` to check backend responses
+
