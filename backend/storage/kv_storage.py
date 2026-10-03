@@ -23,6 +23,7 @@ T = TypeVar("T")
 class StorageNameSpace:
     namespace: str
     storage_dir: str = None
+    workspace_id: str | None = None
 
     async def index_done_callback(self):
         pass
