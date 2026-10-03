@@ -38,7 +38,7 @@ from ..llm import (
     normalize_to_json,
     normalize_to_json_list,
 )
-from ..llm.client import _invoke_titan_embed
+from ..llm.client import embed_texts
 from ..core.prompt import GRAPH_FIELD_SEP, PROMPTS
 from ..utils.base import ensure_quoted, load_json, logger
 
@@ -171,14 +171,24 @@ def _classify_by_nearest_neighbor(input_embeddings, reference_embeddings, labels
 
 def _encode_and_cluster(descriptions: list[str], entity_names: list[str], relationships: list[dict]):
     """Embed + cluster in one executor-safe function (no async allowed here)."""
-    embeddings = _sanitize_embeddings(_invoke_titan_embed(descriptions))
+    embeddings = _sanitize_embeddings(_sync_embed_texts(descriptions))
     labels = _compute_spectral_labels(embeddings, entity_names, relationships)
     return embeddings, labels
 
 
 def _encode_texts(texts: list[str]) -> np.ndarray:
     """Embed a list of texts — executor-safe."""
-    return _invoke_titan_embed(texts)
+    return _sync_embed_texts(texts)
+
+
+def _sync_embed_texts(texts: list[str]) -> np.ndarray:
+    """Sync wrapper for embed_texts(), safe to call from inside an executor thread.
+    
+    Each executor thread has no running event loop, so asyncio.run() starts a fresh
+    event loop just for this call, respecting EMBEDDING_PROVIDER branching (Gemini
+    free tier by default, Bedrock fallback, or OpenAI-compatible).
+    """
+    return asyncio.run(embed_texts(texts))
 
 
 # ============================================================================

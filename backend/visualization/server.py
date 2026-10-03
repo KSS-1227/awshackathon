@@ -147,9 +147,10 @@ def graph_retrieve():
         return jsonify([])
 
     try:
+        import asyncio
         import numpy as np
         from sklearn.metrics.pairwise import cosine_similarity
-        from ..llm.client import _invoke_titan_embed
+        from ..llm.client import embed_texts
 
         embed_path   = os.path.join(parameter.OUTPUT_DIR, f"{parameter.MMKG_NAME}_emb.npy")
         graph_path   = _get_graph_path()
@@ -162,9 +163,10 @@ def graph_retrieve():
         if os.path.exists(embed_path):
             embeddings = np.load(embed_path)
         else:
-            embeddings = _invoke_titan_embed(descs)
+            # Use provider-aware embed_texts via asyncio.run (respects EMBEDDING_PROVIDER)
+            embeddings = asyncio.run(embed_texts(descs))
 
-        q_emb = _invoke_titan_embed([query])
+        q_emb = asyncio.run(embed_texts([query]))
         sims  = cosine_similarity(q_emb, embeddings)[0]
         idxs  = np.argsort(sims)[::-1][:top_k]
 
