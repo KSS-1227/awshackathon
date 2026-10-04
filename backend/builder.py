@@ -304,16 +304,13 @@ class MMKGBuilder:
         """Run the sequential graph-merge stages for a single file.
 
         This covers everything that writes to shared state: text extraction,
-        image extraction, graph fusion, and the optional CockroachDB sync.
+        image extraction, and graph fusion.
 
-        Returns True if image fusion ran (so the caller knows whether
-        _step_sync_graph_snapshot was triggered).
+        Returns True if image fusion ran.
         """
         await self._step_text_extraction()
         img_ids = await self._step_image_extraction()
         await self._step_fusion(img_ids)
-        if img_ids:
-            await self._step_sync_graph_snapshot()
         return bool(img_ids)
 
     async def _step_preprocessing(self, file_path: str):
