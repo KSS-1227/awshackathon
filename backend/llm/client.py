@@ -34,15 +34,18 @@ from ..config.settings import (
     BEDROCK_TEXT_MODEL_ID,
     EMBEDDING_API_BASE,
     EMBEDDING_API_KEY,
+    EMBEDDING_API_KEYS,
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL_NAME,
     EMBEDDING_PROVIDER,
     LLM_API_BASE,
     LLM_API_KEY,
+    LLM_API_KEYS,
     LLM_MODEL_NAME,
     LLM_PROVIDER,
     MM_API_BASE,
     MM_API_KEY,
+    MM_API_KEYS,
     MM_MODEL_NAME,
     MM_PROVIDER,
 )
@@ -97,6 +100,8 @@ async def _call_openai_compatible(
     system: str | None = None,
     max_tokens: int = 4096,
     is_vision: bool = False,
+    key_index: int = 1,
+    keys_total: int = 1,
 ) -> str:
     """Generic OpenAI-compatible API call (works with Gemini, OpenAI, etc.)."""
     if not api_key:
@@ -128,9 +133,11 @@ async def _call_openai_compatible(
             # Log error details
             error_body = response.text
             logger.warning(
-                "API error %d for %s: %s",
+                "API error %d for %s (key %d/%d): %s",
                 response.status_code,
                 url,
+                key_index,
+                keys_total,
                 error_body[:200],
             )
         
@@ -167,7 +174,7 @@ def _converse_bedrock(
 # ============================================================================
 
 async def _with_retry(async_fn, max_retries: int = 3, base_delay: float = 1.0):
-    """Exponential backoff for transient errors."""
+    """Exponential backoff for transient errors (503, timeouts, etc.)."""
     for attempt in range(max_retries + 1):
         try:
             return await async_fn()
@@ -183,6 +190,89 @@ async def _with_retry(async_fn, max_retries: int = 3, base_delay: float = 1.0):
 
 
 # ============================================================================
+# Multi-key rotation for 429 quota exhaustion
+# ============================================================================
+
+class QuotaExhaustedError(Exception):
+    """Raised when all keys in rotation are exhausted (429 on all keys)."""
+    pass
+
+
+async def _with_key_rotation(
+    async_fn,
+    api_keys: list[str],
+    call_type: str,  # "text", "vision", or "embedding" for logging
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+) -> str:
+    """
+    Wraps async_fn with key rotation on 429 (quota exhaustion).
+    
+    On 429: tries next key in list, runs full retry-with-backoff on each key.
+    On 503: retries same key (no key rotation), uses existing retry logic.
+    
+    Args:
+        async_fn: async function that takes (api_key, key_index, keys_total) and returns result
+        api_keys: list of API keys to rotate through
+        call_type: logging label ("text", "vision", or "embedding")
+        max_retries: retries per key before moving to next
+        base_delay: initial backoff delay
+    
+    Returns:
+        Result from async_fn with a working key
+    
+    Raises:
+        QuotaExhaustedError: if all keys exhausted with 429
+    """
+    if not api_keys:
+        raise ValueError(f"No API keys provided for {call_type} {call_type}")
+    
+    keys_total = len(api_keys)
+    
+    for key_idx, api_key in enumerate(api_keys):
+        logger.info(f"🔑 {call_type.upper()} API: using key {key_idx + 1}/{keys_total}")
+        
+        try:
+            # Run the provided async function with current key
+            return await _with_retry(
+                lambda: async_fn(api_key, key_idx + 1, keys_total),
+                max_retries=max_retries,
+                base_delay=base_delay,
+            )
+        except httpx.HTTPStatusError as e:
+            # Check if it's a 429 (quota exhausted)
+            if e.response.status_code == 429:
+                if key_idx == keys_total - 1:
+                    # Last key also failed with 429
+                    raise QuotaExhaustedError(
+                        f"All {keys_total} {call_type} API key(s) exhausted with 429 quota limit. "
+                        f"Consider adding more keys or waiting for quota reset."
+                    )
+                else:
+                    # Move to next key
+                    logger.warning(
+                        f"🔄 {call_type.upper()} key {key_idx + 1} exhausted (429), rotating to next key..."
+                    )
+                    continue
+            else:
+                # Not a 429, re-raise (let 503 be handled by retry logic)
+                raise
+        except (httpx.HTTPError, ClientError) as e:
+            # Other HTTP errors or client errors on last key
+            if key_idx == keys_total - 1:
+                raise
+            # Try next key
+            logger.warning(
+                f"🔄 {call_type.upper()} key {key_idx + 1} failed ({str(e)[:50]}), rotating to next key..."
+            )
+            continue
+    
+    # Should not reach here, but raise if we do
+    raise QuotaExhaustedError(f"All {keys_total} {call_type} API keys exhausted.")
+
+
+
+# ============================================================================
 # Text LLM — Provider-branched (Bedrock/Gemini/OpenAI-compatible)
 # ============================================================================
 
@@ -192,7 +282,7 @@ async def model_if_cache(
     history_messages: list[dict] | None = None,
     **kwargs,
 ) -> str:
-    """Text LLM call with optional KV caching. Supports multiple providers."""
+    """Text LLM call with optional KV caching and multi-key rotation on 429. Supports multiple providers."""
     if history_messages is None:
         history_messages = []
 
@@ -227,16 +317,33 @@ async def model_if_cache(
                 lambda: _converse_bedrock(client, BEDROCK_TEXT_MODEL_ID, bedrock_messages, system_prompt, max_tokens),
             )
         else:  # gemini, openai, or other OpenAI-compatible
-            return await _call_openai_compatible(
-                api_key=LLM_API_KEY,
-                api_base=LLM_API_BASE,
-                model=LLM_MODEL_NAME,
-                messages=messages,
-                system=system_prompt,
-                max_tokens=max_tokens,
-            )
+            # Use key rotation for Gemini (handles 429 quota exhaustion)
+            async def _call_with_key(api_key: str, key_idx: int, keys_total: int):
+                return await _call_openai_compatible(
+                    api_key=api_key,
+                    api_base=LLM_API_BASE,
+                    model=LLM_MODEL_NAME,
+                    messages=messages,
+                    system=system_prompt,
+                    max_tokens=max_tokens,
+                    key_index=key_idx,
+                    keys_total=keys_total,
+                )
+            
+            # Use multi-key rotation if available, otherwise single key
+            if LLM_API_KEYS and len(LLM_API_KEYS) > 1:
+                return await _with_key_rotation(
+                    _call_with_key,
+                    LLM_API_KEYS,
+                    "text",
+                )
+            else:
+                # Single key or no keys — use simple retry
+                return await _with_retry(
+                    lambda: _call_with_key(LLM_API_KEY, 1, 1),
+                )
 
-    content = await _with_retry(_call)
+    content = await _call()
 
     if hashing_kv and args_hash:
         await hashing_kv.upsert({args_hash: {"return": content, "model": cache_key}})
@@ -261,7 +368,7 @@ async def multimodel_if_cache(
     history_messages: list[dict] | None = None,
     **kwargs,
 ) -> str:
-    """Vision LLM call with optional KV caching. Supports multiple providers."""
+    """Vision LLM call with optional KV caching and multi-key rotation on 429. Supports multiple providers."""
     if history_messages is None:
         history_messages = []
 
@@ -341,17 +448,35 @@ async def multimodel_if_cache(
                     ],
                 },
             ]
-            return await _call_openai_compatible(
-                api_key=MM_API_KEY,
-                api_base=MM_API_BASE,
-                model=MM_MODEL_NAME,
-                messages=messages,
-                system=system_prompt,
-                max_tokens=max_tokens,
-                is_vision=True,
-            )
+            
+            # Use key rotation for Gemini (handles 429 quota exhaustion)
+            async def _call_with_key(api_key: str, key_idx: int, keys_total: int):
+                return await _call_openai_compatible(
+                    api_key=api_key,
+                    api_base=MM_API_BASE,
+                    model=MM_MODEL_NAME,
+                    messages=messages,
+                    system=system_prompt,
+                    max_tokens=max_tokens,
+                    is_vision=True,
+                    key_index=key_idx,
+                    keys_total=keys_total,
+                )
+            
+            # Use multi-key rotation if available, otherwise single key
+            if MM_API_KEYS and len(MM_API_KEYS) > 1:
+                return await _with_key_rotation(
+                    _call_with_key,
+                    MM_API_KEYS,
+                    "vision",
+                )
+            else:
+                # Single key or no keys — use simple retry
+                return await _with_retry(
+                    lambda: _call_with_key(MM_API_KEY, 1, 1),
+                )
 
-    content = await _with_retry(_call)
+    content = await _call()
 
     if hashing_kv and args_hash:
         await hashing_kv.upsert({args_hash: {"return": content, "model": cache_key}})
@@ -390,14 +515,19 @@ def _invoke_titan_embed(texts: list[str]) -> np.ndarray:
     return np.array(vectors, dtype=np.float32)
 
 
-async def _call_gemini_embed(texts: list[str]) -> np.ndarray:
+async def _call_gemini_embed(
+    api_key: str,
+    texts: list[str],
+    key_index: int = 1,
+    keys_total: int = 1,
+) -> np.ndarray:
     """Async embedding call to Gemini via native API (not OpenAI-compatible)."""
-    if not EMBEDDING_API_KEY:
+    if not api_key:
         raise ValueError("EMBEDDING_API_KEY not configured")
     
     # Gemini embeddings use native API, not OpenAI-compatible endpoint
     # Format: https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBEDDING_MODEL_NAME}:embedContent?key={EMBEDDING_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBEDDING_MODEL_NAME}:embedContent?key={api_key}"
     
     headers = {
         "Content-Type": "application/json",
@@ -415,6 +545,16 @@ async def _call_gemini_embed(texts: list[str]) -> np.ndarray:
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, json=payload, headers=headers)
+            
+            if response.status_code != 200:
+                logger.warning(
+                    "Embedding API error %d (key %d/%d): %s",
+                    response.status_code,
+                    key_index,
+                    keys_total,
+                    response.text[:200],
+                )
+            
             response.raise_for_status()
             data = response.json()
             # Gemini native format: data["embedding"]["values"]
@@ -424,12 +564,27 @@ async def _call_gemini_embed(texts: list[str]) -> np.ndarray:
 
 
 async def embed_texts(texts: list[str]) -> np.ndarray:
-    """Provider-branched embedding call. Returns (N, embedding_dim) float32 array."""
+    """Provider-branched embedding call with multi-key rotation on 429. Returns (N, embedding_dim) float32 array."""
     if EMBEDDING_PROVIDER == "bedrock":
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, lambda: _invoke_titan_embed(texts))
     elif EMBEDDING_PROVIDER in ("gemini", "openai"):
-        return await _call_gemini_embed(texts)
+        # Use key rotation for Gemini embeddings (handles 429 quota exhaustion)
+        async def _call_with_key(api_key: str, key_idx: int, keys_total: int):
+            return await _call_gemini_embed(api_key, texts, key_idx, keys_total)
+        
+        # Use multi-key rotation if available, otherwise single key
+        if EMBEDDING_API_KEYS and len(EMBEDDING_API_KEYS) > 1:
+            return await _with_key_rotation(
+                _call_with_key,
+                EMBEDDING_API_KEYS,
+                "embedding",
+            )
+        else:
+            # Single key or no keys — use simple retry
+            return await _with_retry(
+                lambda: _call_with_key(EMBEDDING_API_KEY, 1, 1),
+            )
     else:
         raise ValueError(f"Unknown EMBEDDING_PROVIDER: {EMBEDDING_PROVIDER}")
 

@@ -27,7 +27,13 @@ EMBEDDING_PROVIDER = os.environ.get("EMBEDDING_PROVIDER", "gemini").lower()
 # ============ Text LLM Configuration ============
 # LLM_PROVIDER = "gemini": Gemini API (free tier), OpenAI-compatible endpoint
 # LLM_PROVIDER = "bedrock": AWS Bedrock (legacy fallback)
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+# LLM_API_KEY supports comma-separated list for multi-key rotation on 429 quota exhaustion:
+#   Single key: LLM_API_KEY=key1 (backward compatible)
+#   Multiple: LLM_API_KEY=key1,key2,key3 (rotates on 429, retries 503 on same key)
+_LLM_API_KEY_RAW = os.environ.get("LLM_API_KEY", "")
+LLM_API_KEYS = [k.strip() for k in _LLM_API_KEY_RAW.split(",") if k.strip()] if _LLM_API_KEY_RAW else []
+LLM_API_KEY = LLM_API_KEYS[0] if LLM_API_KEYS else ""  # Primary key for backward compat
+
 LLM_API_BASE = os.environ.get("LLM_API_BASE", "https://generativelanguage.googleapis.com/v1beta/openai/")
 LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "gemini-2.5-flash")
 
@@ -37,7 +43,11 @@ BEDROCK_TEXT_MODEL_ID = os.environ.get("BEDROCK_TEXT_MODEL_ID", "apac.amazon.nov
 # ============ Multimodal/Vision LLM Configuration ============
 # MM_PROVIDER = "gemini": Gemini API (free tier), separate account for independent quota
 # MM_PROVIDER = "bedrock": AWS Bedrock (legacy fallback)
-MM_API_KEY = os.environ.get("MM_API_KEY", "")
+# MM_API_KEY supports comma-separated list for multi-key rotation on 429 quota exhaustion
+_MM_API_KEY_RAW = os.environ.get("MM_API_KEY", "")
+MM_API_KEYS = [k.strip() for k in _MM_API_KEY_RAW.split(",") if k.strip()] if _MM_API_KEY_RAW else []
+MM_API_KEY = MM_API_KEYS[0] if MM_API_KEYS else ""  # Primary key for backward compat
+
 MM_API_BASE = os.environ.get("MM_API_BASE", "https://generativelanguage.googleapis.com/v1beta/openai/")
 MM_MODEL_NAME = os.environ.get("MM_MODEL_NAME", "gemini-2.5-flash")
 
@@ -48,7 +58,15 @@ BEDROCK_MM_MODEL_ID = os.environ.get("BEDROCK_MM_MODEL_ID", "apac.amazon.nova-pr
 # EMBEDDING_PROVIDER = "gemini": Gemini text-embedding-004 API (free tier)
 # EMBEDDING_PROVIDER = "bedrock": AWS Bedrock Titan embeddings (legacy fallback)
 # EMBEDDING_API_KEY: Can reuse LLM_API_KEY or specify separately for independent quota
-EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", "") or LLM_API_KEY  # Falls back to LLM_API_KEY
+# Supports comma-separated list for multi-key rotation on 429 quota exhaustion
+_EMBEDDING_API_KEY_RAW = os.environ.get("EMBEDDING_API_KEY", "")
+if _EMBEDDING_API_KEY_RAW:
+    EMBEDDING_API_KEYS = [k.strip() for k in _EMBEDDING_API_KEY_RAW.split(",") if k.strip()]
+else:
+    # Fall back to LLM_API_KEYS if EMBEDDING_API_KEY not specified
+    EMBEDDING_API_KEYS = LLM_API_KEYS if LLM_API_KEYS else []
+EMBEDDING_API_KEY = EMBEDDING_API_KEYS[0] if EMBEDDING_API_KEYS else ""  # Primary key for backward compat
+
 EMBEDDING_API_BASE = os.environ.get("EMBEDDING_API_BASE", "https://generativelanguage.googleapis.com/v1beta/openai/")
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "text-embedding-004")
 EMBEDDING_DIMENSIONS = int(os.environ.get("EMBEDDING_DIMENSIONS", "768"))  # Gemini embeddings are 768-dim
